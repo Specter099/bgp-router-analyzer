@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from bgp_route_analyzer import diff_snapshots, init_db, save_snapshot
+from bgp_route_analyzer import diff_snapshots, save_snapshot
 
 
 def _make_prefix(network: str, next_hop: str = "1.1.1.1", **overrides) -> dict:
