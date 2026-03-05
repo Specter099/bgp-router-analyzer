@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from bgp_route_analyzer import (
@@ -5,6 +6,7 @@ from bgp_route_analyzer import (
     _snapshot_info,
     init_db,
     list_snapshots,
+    purge_old_snapshots,
     save_snapshot,
 )
 
@@ -75,3 +77,46 @@ def test_load_prefix_map_composite_key(test_db: Path):
     assert len(pmap) == 2
     assert ("10.0.0.0/8", "1.1.1.1") in pmap
     assert ("10.0.0.0/8", "2.2.2.2") in pmap
+
+
+def test_init_db_sets_file_permissions(tmp_path: Path):
+    """[H4] Database file should have restrictive permissions."""
+    import os
+    import stat
+    import sys
+
+    db = tmp_path / "perm_test.db"
+    init_db(db)
+    if sys.platform != "win32":
+        mode = os.stat(db).st_mode
+        assert not (mode & stat.S_IRGRP), "DB should not be group-readable"
+        assert not (mode & stat.S_IROTH), "DB should not be world-readable"
+
+
+def test_purge_old_snapshots(test_db: Path):
+    """[M8] Purge should delete snapshots older than N days."""
+    import sqlite3
+
+    p = [{"network": "10.0.0.0/8", "next_hop": "1.1.1.1", "metric": "0",
+          "local_pref": "100", "weight": "0", "as_path": "65001", "origin": "i"}]
+
+    # Insert a snapshot with old timestamp
+    old_time = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    with sqlite3.connect(test_db) as conn:
+        conn.execute(
+            "INSERT INTO snapshots (router, captured_at, raw_output) VALUES (?, ?, ?)",
+            ("old_rtr", old_time, "old raw"),
+        )
+        conn.commit()
+
+    # Insert a recent snapshot normally
+    save_snapshot("new_rtr", "new raw", p, test_db)
+
+    # Purge snapshots older than 30 days
+    count = purge_old_snapshots(30, db_path=test_db)
+    assert count == 1
+
+    # Only the recent snapshot should remain
+    rows = list_snapshots(db_path=test_db)
+    assert len(rows) == 1
+    assert rows[0]["router"] == "new_rtr"

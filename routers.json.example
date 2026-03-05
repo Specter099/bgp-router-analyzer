@@ -5,7 +5,7 @@
         "password": "changeme",
         "device_type": "cisco_ios",
         "name": "edge-rtr-01",
-        "ssh_strict": false
+        "ssh_strict": true
     },
     {
         "host": "10.0.0.2",

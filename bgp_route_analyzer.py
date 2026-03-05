@@ -16,24 +16,32 @@ Configuration:
         BGP_DB_PATH          - SQLite database path         (default: bgp_snapshots.db)
         BGP_ANALYZER_API_KEY - API key for authentication   (optional, disables auth if unset)
         BGP_CORS_ORIGINS     - comma-separated CORS origins (optional)
+        BGP_ROUTER_PASSWORD  - default router password      (optional, env-based override)
+        BGP_ENABLE_DOCS      - enable OpenAPI docs          (optional, default: disabled)
 
 Usage:
     python bgp_route_analyzer.py --snapshot
     python bgp_route_analyzer.py --diff --before <id> --after <id>
     python bgp_route_analyzer.py --serve
+    python bgp_route_analyzer.py --purge 30
 """
 
 import argparse
+import hmac
 import io
 import json
 import logging
 import os
+import re
+import signal
 import sqlite3
+import stat
 import sys
 import textwrap
+import threading
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import textfsm
@@ -46,7 +54,6 @@ from netmiko import ConnectHandler, NetmikoAuthenticationException, NetmikoTimeo
 from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 
 # ---------------------------------------------------------------------------
@@ -65,14 +72,94 @@ DB_PATH = Path(os.environ.get("BGP_DB_PATH", "bgp_snapshots.db"))
 API_KEY = os.environ.get("BGP_ANALYZER_API_KEY")
 CORS_ORIGINS = [o.strip() for o in os.environ.get("BGP_CORS_ORIGINS", "").split(",") if o.strip()]
 
+# [C3] Allowlisted fields for router config — reject unknown fields
+ALLOWED_ROUTER_FIELDS = frozenset({
+    "host", "device_type", "username", "password", "key_file",
+    "name", "port", "ssh_strict",
+})
+
+# [M5] Supported Netmiko device types
+SUPPORTED_DEVICE_TYPES = frozenset({
+    "cisco_ios", "cisco_xe", "cisco_xr", "cisco_nxos", "cisco_s300",
+    "arista_eos", "juniper_junos", "juniper_junos_telnet",
+    "linux", "linux_ssh", "hp_comware", "hp_procurve",
+    "huawei", "dell_force10", "brocade_fastiron",
+    "mikrotik_routeros", "paloalto_panos", "fortinet",
+    "alcatel_aos", "checkpoint_gaia", "ubiquiti_edgerouter",
+})
+
+# [L5] Maximum size for raw router output (10 MB)
+MAX_RAW_OUTPUT_SIZE = 10 * 1024 * 1024
+
+# [H2] Lock to prevent concurrent snapshot operations
+_snapshot_lock = threading.Lock()
+
+# [L6] Graceful shutdown flag
+_shutdown_requested = False
+
+
+def _signal_handler(signum: int, frame: object) -> None:
+    """Set shutdown flag for graceful termination."""
+    global _shutdown_requested
+    _shutdown_requested = True
+    log.info("Shutdown requested (signal %d), finishing current operation...", signum)
+
 
 def _load_routers(config_path: str | None = None) -> list[dict]:
-    """Load router configuration from an external JSON file."""
+    """Load and validate router configuration from an external JSON file."""
     path = config_path or os.environ.get("BGP_ROUTER_CONFIG", "routers.json")
-    if not Path(path).exists():
+    resolved = Path(path).resolve()  # [M4] canonicalize path
+    if not resolved.exists():
         return []
-    with open(path) as f:
-        return json.load(f)
+
+    # [C4] Check file permissions (Unix only)
+    if sys.platform != "win32":
+        mode = resolved.stat().st_mode
+        if mode & (stat.S_IRGRP | stat.S_IROTH):
+            log.warning(
+                "Router config %s has overly permissive permissions (%o). "
+                "Recommend chmod 600.",
+                resolved, stat.S_IMODE(mode),
+            )
+
+    with open(resolved) as f:
+        raw = json.load(f)
+
+    if not isinstance(raw, list):
+        raise ValueError(f"Router config must be a JSON array, got {type(raw).__name__}")
+
+    # [C4] Support env var password override
+    password_override = os.environ.get("BGP_ROUTER_PASSWORD")
+
+    validated = []
+    for i, router in enumerate(raw):
+        if not isinstance(router, dict):
+            raise ValueError(f"Router config [{i}] must be a JSON object")
+
+        # [C3] Validate required fields
+        for field in ("host", "device_type", "name"):
+            if field not in router:
+                raise ValueError(f"Router config [{i}] missing required field: {field}")
+
+        # [C3] Reject unknown fields
+        unknown = set(router.keys()) - ALLOWED_ROUTER_FIELDS
+        if unknown:
+            raise ValueError(f"Router config [{i}] has unknown fields: {unknown}")
+
+        # [M5] Validate device_type
+        if router["device_type"] not in SUPPORTED_DEVICE_TYPES:
+            raise ValueError(
+                f"Router config [{i}] unsupported device_type: {router['device_type']}. "
+                f"Supported: {sorted(SUPPORTED_DEVICE_TYPES)}"
+            )
+
+        # [C4] Apply env var password override
+        if password_override and "password" not in router:
+            router = {**router, "password": password_override}
+
+        validated.append(router)
+
+    return validated
 
 
 ROUTERS: list[dict] = _load_routers()
@@ -130,14 +217,22 @@ def init_db(db_path: Path | None = None) -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_prefixes_snapshot ON prefixes(snapshot_id)")
         conn.commit()
+    # [H4] Set restrictive file permissions on the database
+    try:
+        os.chmod(db_path, 0o600)
+    except OSError:
+        log.warning("Could not set database file permissions to 0600: %s", db_path)
 
 
 @contextmanager
 def get_db(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
     if db_path is None:
         db_path = DB_PATH
-    conn = sqlite3.connect(db_path)
+    # [M2] Set busy timeout and enable WAL mode for concurrent access
+    conn = sqlite3.connect(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()
@@ -155,7 +250,9 @@ def poll_router(router_cfg: dict) -> tuple[str, list[dict]]:
     SSH into a router, run 'show ip bgp', parse with TextFSM.
     Returns (raw_output, list_of_prefix_dicts).
     """
-    log.info("Connecting to %s (%s)", router_cfg["name"], router_cfg["host"])
+    # [M3] Log router name at INFO, IP only at DEBUG
+    log.info("Connecting to %s", router_cfg["name"])
+    log.debug("Router %s address: %s", router_cfg["name"], router_cfg["host"])
     try:
         connection = ConnectHandler(
             host=router_cfg["host"],
@@ -163,20 +260,28 @@ def poll_router(router_cfg: dict) -> tuple[str, list[dict]]:
             password=router_cfg.get("password", ""),
             device_type=router_cfg["device_type"],
             key_file=router_cfg.get("key_file"),
-            ssh_strict=router_cfg.get("ssh_strict", False),
+            ssh_strict=router_cfg.get("ssh_strict", True),  # [C1] Default True
             timeout=30,
         )
     except NetmikoAuthenticationException:
-        log.error("Auth failed for %s (%s)", router_cfg["name"], router_cfg["host"])
+        log.error("Auth failed for %s", router_cfg["name"])
         raise RuntimeError(f"Authentication failed for {router_cfg['name']}") from None
     except NetmikoTimeoutException:
-        log.error("Timeout connecting to %s (%s)", router_cfg["name"], router_cfg["host"])
+        log.error("Timeout connecting to %s", router_cfg["name"])
         raise RuntimeError(f"Timeout connecting to {router_cfg['name']}") from None
 
     try:
         raw = connection.send_command("show ip bgp", read_timeout=60)
     finally:
         connection.disconnect()
+
+    # [L5] Truncate oversized output
+    if len(raw) > MAX_RAW_OUTPUT_SIZE:
+        log.warning(
+            "Raw output from %s exceeds %d bytes, truncating",
+            router_cfg["name"], MAX_RAW_OUTPUT_SIZE,
+        )
+        raw = raw[:MAX_RAW_OUTPUT_SIZE]
 
     prefixes = _parse_bgp_table(raw)
     log.info("  -> %d prefixes parsed from %s", len(prefixes), router_cfg["name"])
@@ -236,6 +341,10 @@ def take_snapshots(
     init_db(db_path)
     snap_ids = []
     for router_cfg in routers:
+        # [L6] Check for graceful shutdown
+        if _shutdown_requested:
+            log.info("Shutdown requested, stopping snapshot collection")
+            break
         try:
             raw, prefixes = poll_router(router_cfg)
             sid = save_snapshot(router_cfg["name"], raw, prefixes, db_path)
@@ -243,6 +352,28 @@ def take_snapshots(
         except (RuntimeError, sqlite3.Error) as exc:
             log.error("Failed to snapshot %s: %s", router_cfg.get("name", "?"), exc)
     return snap_ids
+
+
+# ---------------------------------------------------------------------------
+# Data retention
+# ---------------------------------------------------------------------------
+
+
+def purge_old_snapshots(days: int, db_path: Path | None = None) -> int:
+    """Delete snapshots older than N days. Returns count of deleted snapshots."""
+    if db_path is None:
+        db_path = DB_PATH
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with get_db(db_path) as conn:
+        conn.execute(
+            "DELETE FROM prefixes WHERE snapshot_id IN "
+            "(SELECT id FROM snapshots WHERE captured_at < ?)",
+            (cutoff,),
+        )
+        cur = conn.execute("DELETE FROM snapshots WHERE captured_at < ?", (cutoff,))
+        count = cur.rowcount
+    log.info("Purged %d snapshot(s) older than %d days", count, days)
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -396,18 +527,31 @@ class DiffResponse(BaseModel):
 # FastAPI REST layer
 # ---------------------------------------------------------------------------
 
-# Rate limiter
-limiter = Limiter(key_func=get_remote_address)
+
+# [H1] Custom key function that ignores proxy headers
+def _get_client_ip(request: Request) -> str:
+    """Get client IP directly from socket, ignoring X-Forwarded-For."""
+    return request.client.host if request.client else "127.0.0.1"
+
+
+# Rate limiter — uses direct client IP, not proxy headers
+limiter = Limiter(key_func=_get_client_ip)
 
 # Auth dependency
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
-async def verify_api_key(key: str | None = Security(api_key_header)) -> None:
+async def verify_api_key(
+    request: Request,
+    key: str | None = Security(api_key_header),
+) -> None:
     """Verify API key if BGP_ANALYZER_API_KEY is configured."""
     if API_KEY is None:
         return
-    if key != API_KEY:
+    if key is None or not hmac.compare_digest(key, API_KEY):  # [C2] Timing-safe comparison
+        # [L3] Log failed authentication attempts
+        client = request.client.host if request.client else "unknown"
+        log.warning("Authentication failure from %s", client)
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
 
 
@@ -420,6 +564,33 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
         return response
 
 
+# [H3] Security response headers middleware
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):  # type: ignore[override]
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Content-Security-Policy"] = "default-src 'none'"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
+
+# [M7] Validate CORS origins
+def _validate_cors_origins(origins: list[str]) -> list[str]:
+    """Validate CORS origins. Reject wildcard when API key auth is enabled."""
+    validated = []
+    for origin in origins:
+        if origin == "*" and API_KEY:
+            log.warning("Rejecting wildcard CORS origin (*) because API key auth is enabled")
+            continue
+        if origin != "*" and not re.match(r"^https?://[a-zA-Z0-9._:@\[\]-]+$", origin):
+            log.warning("Invalid CORS origin ignored: %s", origin)
+            continue
+        validated.append(origin)
+    return validated
+
+
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     init_db()
@@ -430,36 +601,49 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
 
+# [L2] Gate OpenAPI docs behind environment variable
+_docs_enabled = os.environ.get("BGP_ENABLE_DOCS", "").lower() in ("1", "true", "yes")
+
 app = FastAPI(
     title="BGP Route Analyzer",
     description="NOC-facing API to snapshot and diff BGP tables across edge routers.",
     version="1.0.0",
     dependencies=[Depends(verify_api_key)],
     lifespan=lifespan,
+    docs_url="/docs" if _docs_enabled else None,
+    redoc_url="/redoc" if _docs_enabled else None,
 )
 
 # Middleware & exception handlers
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
+app.add_middleware(SecurityHeadersMiddleware)  # [H3] Security headers
 app.add_middleware(AccessLogMiddleware)
 
-if CORS_ORIGINS:
+# [M7] Validate and apply CORS
+_validated_origins = _validate_cors_origins(CORS_ORIGINS)
+if _validated_origins:
+    log.info("CORS enabled for origins: %s", _validated_origins)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=CORS_ORIGINS,
+        allow_origins=_validated_origins,
         allow_methods=["GET", "POST"],
         allow_headers=["X-API-Key"],
     )
 
 
+# [H6] Sanitized exception handler — log type only, details at DEBUG
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    log.error("Unhandled exception on %s %s: %s", request.method, request.url.path, exc)
+    log.error("Unhandled %s on %s %s", type(exc).__name__, request.method, request.url.path)
+    log.debug("Exception details:", exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
+# [M6] Rate limit all endpoints with appropriate thresholds
 @app.get("/health")
-def health() -> dict:
+@limiter.limit("60/minute")
+def health(request: Request) -> dict:
     return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
@@ -469,7 +653,13 @@ def api_take_snapshots(request: Request) -> SnapshotResponse:
     """Poll all configured routers and store BGP table snapshots."""
     if not ROUTERS:
         raise HTTPException(status_code=503, detail="No routers configured.")
-    snap_ids = take_snapshots()
+    # [H2] Prevent concurrent snapshot operations
+    if not _snapshot_lock.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail="Snapshot already in progress.")
+    try:
+        snap_ids = take_snapshots()
+    finally:
+        _snapshot_lock.release()
     return SnapshotResponse(
         snapshot_ids=snap_ids,
         message=f"Captured {len(snap_ids)} snapshot(s).",
@@ -477,7 +667,9 @@ def api_take_snapshots(request: Request) -> SnapshotResponse:
 
 
 @app.get("/snapshots")
+@limiter.limit("30/minute")
 def api_list_snapshots(
+    request: Request,
     router: str | None = Query(None, pattern=r"^[a-zA-Z0-9._-]{1,64}$", description="Filter by router name"),
     limit: int = Query(20, ge=1, le=200),
 ) -> list[dict]:
@@ -486,7 +678,8 @@ def api_list_snapshots(
 
 
 @app.get("/snapshots/{snapshot_id}")
-def api_get_snapshot(snapshot_id: int) -> dict:
+@limiter.limit("30/minute")
+def api_get_snapshot(request: Request, snapshot_id: int) -> dict:
     """Return metadata for a specific snapshot."""
     info = _snapshot_info(snapshot_id)
     if not info:
@@ -496,7 +689,9 @@ def api_get_snapshot(snapshot_id: int) -> dict:
 
 
 @app.get("/diff", response_model=DiffResponse)
+@limiter.limit("10/minute")
 def api_diff(
+    request: Request,
     before: int = Query(..., description="Snapshot ID before change window"),
     after: int = Query(..., description="Snapshot ID after change window"),
 ) -> dict:
@@ -522,6 +717,8 @@ def _cli() -> None:
     group.add_argument("--diff", action="store_true", help="Diff two snapshots")
     group.add_argument("--list", action="store_true", help="List stored snapshots")
     group.add_argument("--serve", action="store_true", help="Start FastAPI server")
+    group.add_argument("--purge", type=int, metavar="DAYS",
+                       help="Delete snapshots older than N days")  # [M8]
 
     parser.add_argument("--before", type=int, help="Snapshot ID before change window (for --diff)")
     parser.add_argument("--after", type=int, help="Snapshot ID after change window (for --diff)")
@@ -535,8 +732,12 @@ def _cli() -> None:
 
     args = parser.parse_args()
 
-    # Validate database path
-    db = Path(args.db)
+    # [L6] Install signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    # [M4] Validate and canonicalize database path
+    db = Path(args.db).resolve()
     if not db.parent.exists():
         print(f"ERROR: Parent directory {db.parent} does not exist.", file=sys.stderr)
         sys.exit(1)
@@ -544,8 +745,9 @@ def _cli() -> None:
 
     # Load router config override if specified
     if args.router_config:
+        config_path = Path(args.router_config).resolve()  # [M4]
         ROUTERS.clear()
-        ROUTERS.extend(_load_routers(args.router_config))
+        ROUTERS.extend(_load_routers(str(config_path)))
 
     if args.snapshot:
         if not ROUTERS:
@@ -565,12 +767,41 @@ def _cli() -> None:
         for r in rows:
             print(f"  [{r['id']:4d}]  {r['router']:30s}  {r['captured_at']}")
 
+    elif args.purge is not None:
+        count = purge_old_snapshots(args.purge, db_path=db)
+        print(f"Purged {count} snapshot(s) older than {args.purge} days.")
+
     elif args.serve:
+        # [H5] Warn when API key auth is enabled but TLS is not configured
+        if API_KEY and not (args.ssl_cert and args.ssl_key):
+            log.warning(
+                "API key authentication is enabled but TLS is not configured. "
+                "API keys will be transmitted in plaintext. Use --ssl-cert and --ssl-key."
+            )
+
+        # [M1] Warn when binding to non-loopback without API key
+        if args.host != "127.0.0.1" and not API_KEY:
+            log.warning(
+                "Binding to %s without API key authentication. "
+                "The API will be accessible without authentication.",
+                args.host,
+            )
+
         ssl_kwargs: dict = {}
         if args.ssl_cert and args.ssl_key:
             ssl_kwargs["ssl_certfile"] = args.ssl_cert
             ssl_kwargs["ssl_keyfile"] = args.ssl_key
-        uvicorn.run(app, host=args.host, port=args.port, **ssl_kwargs)
+
+        # [M9] Hardened Uvicorn settings
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            server_header=False,
+            limit_concurrency=100,
+            limit_max_requests=10000,
+            **ssl_kwargs,
+        )
 
 
 if __name__ == "__main__":
