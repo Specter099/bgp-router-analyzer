@@ -38,6 +38,7 @@ class TestLoadRouters:
             "host": "10.0.0.1",
             "device_type": "cisco_ios",
             "name": "rtr1",
+            "username": "admin",
             "evil_param": "injected",
         }]))
         with pytest.raises(ValueError, match="unknown fields"):
@@ -50,6 +51,7 @@ class TestLoadRouters:
             "host": "10.0.0.1",
             "device_type": "not_a_real_device",
             "name": "rtr1",
+            "username": "admin",
         }]))
         with pytest.raises(ValueError, match="unsupported device_type"):
             _load_routers(str(config))
@@ -72,6 +74,7 @@ class TestLoadRouters:
             "host": "10.0.0.1",
             "device_type": "cisco_ios",
             "name": "rtr1",
+            "username": "admin",
         }]))
         routers = _load_routers(str(config))
         assert routers[0]["password"] == "env-secret"
@@ -84,10 +87,29 @@ class TestLoadRouters:
             "host": "10.0.0.1",
             "device_type": "cisco_ios",
             "name": "rtr1",
+            "username": "admin",
             "password": "config-secret",
         }]))
         routers = _load_routers(str(config))
         assert routers[0]["password"] == "config-secret"
+
+    def test_missing_username_rejected(self, tmp_path: Path):
+        """[O-H4] Missing username should be rejected."""
+        config = tmp_path / "routers.json"
+        config.write_text(json.dumps([{
+            "host": "10.0.0.1",
+            "device_type": "cisco_ios",
+            "name": "rtr1",
+        }]))
+        with pytest.raises(ValueError, match="missing required field: username"):
+            _load_routers(str(config))
+
+    def test_malformed_json_returns_empty(self, tmp_path: Path):
+        """[O-C1] Malformed JSON should return empty list, not crash."""
+        config = tmp_path / "routers.json"
+        config.write_text('{"host": "10.0.0.1",}')  # trailing comma = invalid JSON
+        routers = _load_routers(str(config))
+        assert routers == []
 
 
 class TestValidateCorsOrigins:

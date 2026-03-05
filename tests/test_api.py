@@ -163,3 +163,59 @@ def test_docs_disabled_by_default(client):
 
     resp = client.get("/redoc")
     assert resp.status_code == 404
+
+
+# --- New tests for operational findings ---
+
+
+def test_snapshot_id_zero_rejected(client):
+    """[O-M1] Zero snapshot ID should be rejected."""
+    resp = client.get("/snapshots/0")
+    assert resp.status_code == 422
+
+
+def test_snapshot_id_negative_rejected(client):
+    """[O-M1] Negative snapshot ID should be rejected."""
+    resp = client.get("/snapshots/-1")
+    assert resp.status_code == 422
+
+
+def test_diff_before_equals_after(seeded_client):
+    """[O-M3] Diffing a snapshot against itself should return 400."""
+    resp = seeded_client.get("/diff?before=1&after=1")
+    assert resp.status_code == 400
+    assert "different" in resp.json()["detail"]
+
+
+def test_diff_negative_ids_rejected(client):
+    """[O-M1] Negative diff IDs should be rejected."""
+    resp = client.get("/diff?before=-1&after=2")
+    assert resp.status_code == 422
+
+    resp = client.get("/diff?before=1&after=0")
+    assert resp.status_code == 422
+
+
+def test_get_snapshot_response_shape(seeded_client):
+    """[O-M2] Response should match SnapshotDetailResponse model."""
+    resp = seeded_client.get("/snapshots/1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "snapshot" in data
+    assert "prefix_count" in data
+    assert "prefixes" in data
+    assert "id" in data["snapshot"]
+    assert "router" in data["snapshot"]
+    assert "captured_at" in data["snapshot"]
+
+
+def test_list_snapshots_response_shape(seeded_client):
+    """[O-M2] List response should match SnapshotListItem model."""
+    resp = seeded_client.get("/snapshots")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) > 0
+    item = data[0]
+    assert "id" in item
+    assert "router" in item
+    assert "captured_at" in item
