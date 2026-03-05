@@ -126,3 +126,40 @@ def test_api_key_auth_required(tmp_path: Path, monkeypatch):
         # Correct key -> 200
         resp = c.get("/health", headers={"X-API-Key": "test-secret-key"})
         assert resp.status_code == 200
+
+
+# --- New tests for security findings ---
+
+
+def test_security_headers_present(client):
+    """[H3] All responses should include security headers."""
+    resp = client.get("/health")
+    assert resp.headers["X-Content-Type-Options"] == "nosniff"
+    assert resp.headers["X-Frame-Options"] == "DENY"
+    assert resp.headers["Cache-Control"] == "no-store"
+    assert resp.headers["Content-Security-Policy"] == "default-src 'none'"
+    assert resp.headers["Referrer-Policy"] == "no-referrer"
+
+
+def test_snapshot_lock_prevents_concurrent(client, monkeypatch):
+    """[H2] Second concurrent snapshot request should return 429."""
+    from bgp_route_analyzer import _snapshot_lock
+
+    monkeypatch.setattr("bgp_route_analyzer.ROUTERS", [{"name": "test"}])
+    # Acquire the lock to simulate an in-progress snapshot
+    _snapshot_lock.acquire()
+    try:
+        resp = client.post("/snapshots")
+        assert resp.status_code == 429
+        assert "already in progress" in resp.json()["detail"]
+    finally:
+        _snapshot_lock.release()
+
+
+def test_docs_disabled_by_default(client):
+    """[L2] OpenAPI docs should be disabled by default."""
+    resp = client.get("/docs")
+    assert resp.status_code == 404
+
+    resp = client.get("/redoc")
+    assert resp.status_code == 404
