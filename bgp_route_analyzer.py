@@ -46,7 +46,7 @@ from pathlib import Path
 
 import textfsm
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Query, Request, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
@@ -94,15 +94,18 @@ MAX_RAW_OUTPUT_SIZE = 10 * 1024 * 1024
 # [H2] Lock to prevent concurrent snapshot operations
 _snapshot_lock = threading.Lock()
 
-# [L6] Graceful shutdown flag
-_shutdown_requested = False
+# [L6][O-M6] Graceful shutdown — use threading.Event for thread safety
+_shutdown_event = threading.Event()
 
 
 def _signal_handler(signum: int, frame: object) -> None:
-    """Set shutdown flag for graceful termination."""
-    global _shutdown_requested
-    _shutdown_requested = True
-    log.info("Shutdown requested (signal %d), finishing current operation...", signum)
+    """Set shutdown flag for graceful termination.
+
+    Note: logging is intentionally avoided here because it acquires locks
+    and is not async-signal-safe (could deadlock if signal arrives during
+    another log call). [O-H1]
+    """
+    _shutdown_event.set()
 
 
 def _load_routers(config_path: str | None = None) -> list[dict]:
@@ -122,8 +125,13 @@ def _load_routers(config_path: str | None = None) -> list[dict]:
                 resolved, stat.S_IMODE(mode),
             )
 
-    with open(resolved) as f:
-        raw = json.load(f)
+    # [O-C1] Handle malformed JSON gracefully instead of crashing at import
+    try:
+        with open(resolved) as f:
+            raw = json.load(f)
+    except json.JSONDecodeError as e:
+        log.error("Invalid JSON in router config %s: %s", resolved, e)
+        return []
 
     if not isinstance(raw, list):
         raise ValueError(f"Router config must be a JSON array, got {type(raw).__name__}")
@@ -136,8 +144,8 @@ def _load_routers(config_path: str | None = None) -> list[dict]:
         if not isinstance(router, dict):
             raise ValueError(f"Router config [{i}] must be a JSON object")
 
-        # [C3] Validate required fields
-        for field in ("host", "device_type", "name"):
+        # [C3][O-H4] Validate required fields (username needed for SSH)
+        for field in ("host", "device_type", "name", "username"):
             if field not in router:
                 raise ValueError(f"Router config [{i}] missing required field: {field}")
 
@@ -233,9 +241,13 @@ def get_db(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, N
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA foreign_keys=ON")  # [O-M9] Enforce FK constraints
     try:
         yield conn
         conn.commit()
+    except BaseException:
+        conn.rollback()  # [O-C2] Explicit rollback on exception
+        raise
     finally:
         conn.close()
 
@@ -273,7 +285,10 @@ def poll_router(router_cfg: dict) -> tuple[str, list[dict]]:
     try:
         raw = connection.send_command("show ip bgp", read_timeout=60)
     finally:
-        connection.disconnect()
+        try:
+            connection.disconnect()
+        except Exception:
+            log.debug("Error during disconnect from %s", router_cfg["name"], exc_info=True)  # [O-M7]
 
     # [L5] Truncate oversized output
     if len(raw) > MAX_RAW_OUTPUT_SIZE:
@@ -284,6 +299,13 @@ def poll_router(router_cfg: dict) -> tuple[str, list[dict]]:
         raw = raw[:MAX_RAW_OUTPUT_SIZE]
 
     prefixes = _parse_bgp_table(raw)
+    # [O-M5] Warn when output is non-empty but no prefixes parsed
+    if not prefixes and raw.strip():
+        log.warning(
+            "Router %s returned output but 0 prefixes parsed — output may not be "
+            "a valid BGP table. First 200 chars: %.200s",
+            router_cfg["name"], raw.strip(),
+        )
     log.info("  -> %d prefixes parsed from %s", len(prefixes), router_cfg["name"])
     return raw, prefixes
 
@@ -318,12 +340,19 @@ def save_snapshot(
             (router_name, captured_at, raw_output),
         )
         snap_id = cur.lastrowid
-        assert snap_id is not None, "INSERT did not return a row id"
+        if snap_id is None:  # [O-H2] Runtime check, not assert (survives -O)
+            raise RuntimeError("INSERT did not return a row id")
+        # [O-H6] Normalize prefix dicts to avoid missing-key errors
+        prefix_fields = ("network", "next_hop", "metric", "local_pref", "weight", "as_path", "origin")
+        normalized = [
+            {**{f: p.get(f, "") for f in prefix_fields}, "snap_id": snap_id}
+            for p in prefixes
+        ]
         conn.executemany(
             """INSERT INTO prefixes
                (snapshot_id, network, next_hop, metric, local_pref, weight, as_path, origin)
                VALUES (:snap_id, :network, :next_hop, :metric, :local_pref, :weight, :as_path, :origin)""",
-            [{**p, "snap_id": snap_id} for p in prefixes],
+            normalized,
         )
     log.info("Saved snapshot id=%d for router=%s at %s", snap_id, router_name, captured_at)
     return snap_id
@@ -341,15 +370,15 @@ def take_snapshots(
     init_db(db_path)
     snap_ids = []
     for router_cfg in routers:
-        # [L6] Check for graceful shutdown
-        if _shutdown_requested:
+        # [L6][O-M6] Check for graceful shutdown via thread-safe Event
+        if _shutdown_event.is_set():
             log.info("Shutdown requested, stopping snapshot collection")
             break
         try:
             raw, prefixes = poll_router(router_cfg)
             sid = save_snapshot(router_cfg["name"], raw, prefixes, db_path)
             snap_ids.append(sid)
-        except (RuntimeError, sqlite3.Error) as exc:
+        except Exception as exc:  # [O-H3] Broad catch — one failing router must not abort others
             log.error("Failed to snapshot %s: %s", router_cfg.get("name", "?"), exc)
     return snap_ids
 
@@ -398,7 +427,14 @@ def _load_prefix_map(
             "FROM prefixes WHERE snapshot_id = ?",
             (snapshot_id,),
         ).fetchall()
-    return {(row["network"], row["next_hop"] or ""): dict(row) for row in rows}
+    # [O-M12] Warn on duplicate composite keys instead of silently collapsing
+    result: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row["network"], row["next_hop"] or "")
+        if key in result:
+            log.warning("Duplicate composite key %s in snapshot %d", key, snapshot_id)
+        result[key] = dict(row)
+    return result
 
 
 def diff_snapshots(
@@ -521,6 +557,19 @@ class DiffResponse(BaseModel):
     added: list[PrefixInfo]
     removed: list[PrefixInfo]
     changed: list[PrefixChange]
+
+
+# [O-M2] Response models for snapshot endpoints
+class SnapshotListItem(BaseModel):
+    id: int
+    router: str
+    captured_at: str
+
+
+class SnapshotDetailResponse(BaseModel):
+    snapshot: SnapshotListItem
+    prefix_count: int
+    prefixes: list[PrefixInfo]
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +715,7 @@ def api_take_snapshots(request: Request) -> SnapshotResponse:
     )
 
 
-@app.get("/snapshots")
+@app.get("/snapshots", response_model=list[SnapshotListItem])
 @limiter.limit("30/minute")
 def api_list_snapshots(
     request: Request,
@@ -677,28 +726,41 @@ def api_list_snapshots(
     return list_snapshots(router=router, limit=limit)
 
 
-@app.get("/snapshots/{snapshot_id}")
+@app.get("/snapshots/{snapshot_id}", response_model=SnapshotDetailResponse)
 @limiter.limit("30/minute")
-def api_get_snapshot(request: Request, snapshot_id: int) -> dict:
+def api_get_snapshot(request: Request, snapshot_id: int = PathParam(..., ge=1)) -> dict:  # [O-M1]
     """Return metadata for a specific snapshot."""
-    info = _snapshot_info(snapshot_id)
-    if not info:
-        raise HTTPException(status_code=404, detail=f"Snapshot {snapshot_id} not found.")
-    prefixes = _load_prefix_map(snapshot_id)
-    return {"snapshot": info, "prefix_count": len(prefixes), "prefixes": list(prefixes.values())}
+    # [O-H7] Single DB connection to avoid TOCTOU race with concurrent purge
+    with get_db() as conn:
+        row = conn.execute(
+            "SELECT id, router, captured_at FROM snapshots WHERE id = ?", (snapshot_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Snapshot {snapshot_id} not found.")
+        info = dict(row)
+        prefix_rows = conn.execute(
+            "SELECT network, next_hop, metric, local_pref, weight, as_path, origin "
+            "FROM prefixes WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchall()
+    prefixes = [dict(r) for r in prefix_rows]
+    return {"snapshot": info, "prefix_count": len(prefixes), "prefixes": prefixes}
 
 
 @app.get("/diff", response_model=DiffResponse)
 @limiter.limit("10/minute")
 def api_diff(
     request: Request,
-    before: int = Query(..., description="Snapshot ID before change window"),
-    after: int = Query(..., description="Snapshot ID after change window"),
+    before: int = Query(..., ge=1, description="Snapshot ID before change window"),  # [O-M1]
+    after: int = Query(..., ge=1, description="Snapshot ID after change window"),
 ) -> dict:
     """
     Compare two snapshots. Highlights added/removed prefixes and path changes.
     Ideal for post-change verification — catches route leaks and unexpected path shifts.
     """
+    # [O-M3] Reject self-comparison
+    if before == after:
+        raise HTTPException(status_code=400, detail="before and after must be different snapshot IDs.")
     for sid in (before, after):
         if not _snapshot_info(sid):
             raise HTTPException(status_code=404, detail=f"Snapshot {sid} not found.")
@@ -711,6 +773,7 @@ def api_diff(
 
 
 def _cli() -> None:
+    global DB_PATH  # [O-C3] Propagate --db to global so API endpoints use it
     parser = argparse.ArgumentParser(description="BGP Route Analysis Tool")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--snapshot", action="store_true", help="Poll routers and save snapshots")
@@ -741,6 +804,7 @@ def _cli() -> None:
     if not db.parent.exists():
         print(f"ERROR: Parent directory {db.parent} does not exist.", file=sys.stderr)
         sys.exit(1)
+    DB_PATH = db
     init_db(db)
 
     # Load router config override if specified
@@ -757,8 +821,16 @@ def _cli() -> None:
         print(f"Snapshots saved: {ids}")
 
     elif args.diff:
-        if not args.before or not args.after:
+        # [O-M4] Check for None (not falsy) and validate positive IDs
+        if args.before is None or args.after is None:
             parser.error("--diff requires --before and --after snapshot IDs")
+        if args.before < 1 or args.after < 1:
+            parser.error("--diff requires positive snapshot IDs (>= 1)")
+        # Validate snapshots exist before diffing
+        for sid in (args.before, args.after):
+            if _snapshot_info(sid, db) is None:
+                print(f"ERROR: Snapshot {sid} not found.", file=sys.stderr)
+                sys.exit(1)
         result = diff_snapshots(args.before, args.after, db_path=db)
         print(json.dumps(result, indent=2))
 
@@ -768,10 +840,18 @@ def _cli() -> None:
             print(f"  [{r['id']:4d}]  {r['router']:30s}  {r['captured_at']}")
 
     elif args.purge is not None:
+        # [O-H5] Validate purge days to prevent accidental total deletion
+        if args.purge < 1:
+            print("ERROR: --purge requires a positive number of days (>= 1).", file=sys.stderr)
+            sys.exit(1)
         count = purge_old_snapshots(args.purge, db_path=db)
         print(f"Purged {count} snapshot(s) older than {args.purge} days.")
 
     elif args.serve:
+        # [O-M10] Validate port range
+        if not (1 <= args.port <= 65535):
+            print(f"ERROR: --port must be between 1 and 65535, got {args.port}.", file=sys.stderr)
+            sys.exit(1)
         # [H5] Warn when API key auth is enabled but TLS is not configured
         if API_KEY and not (args.ssl_cert and args.ssl_key):
             log.warning(
