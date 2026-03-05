@@ -1,0 +1,128 @@
+import pytest
+from pathlib import Path
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+
+from bgp_route_analyzer import app, init_db, save_snapshot
+
+
+@pytest.fixture
+def client(tmp_path: Path, monkeypatch):
+    db = tmp_path / "api_test.db"
+    monkeypatch.setattr("bgp_route_analyzer.DB_PATH", db)
+    monkeypatch.setattr("bgp_route_analyzer.API_KEY", None)  # disable auth for tests
+    with TestClient(app) as c:
+        yield c
+
+
+@pytest.fixture
+def seeded_client(tmp_path: Path, monkeypatch):
+    """Client with pre-seeded snapshot data."""
+    db = tmp_path / "api_test.db"
+    monkeypatch.setattr("bgp_route_analyzer.DB_PATH", db)
+    monkeypatch.setattr("bgp_route_analyzer.API_KEY", None)
+    init_db(db)
+
+    prefixes_before = [
+        {"network": "10.0.0.0/8", "next_hop": "1.1.1.1", "metric": "0",
+         "local_pref": "100", "weight": "0", "as_path": "65001", "origin": "i"},
+    ]
+    prefixes_after = [
+        {"network": "10.0.0.0/8", "next_hop": "1.1.1.1", "metric": "0",
+         "local_pref": "100", "weight": "0", "as_path": "65001 65099", "origin": "i"},
+        {"network": "192.168.1.0/24", "next_hop": "2.2.2.2", "metric": "0",
+         "local_pref": "100", "weight": "0", "as_path": "65002", "origin": "i"},
+    ]
+    save_snapshot("rtr1", "raw1", prefixes_before, db)
+    save_snapshot("rtr1", "raw2", prefixes_after, db)
+
+    with TestClient(app) as c:
+        yield c
+
+
+def test_health(client):
+    resp = client.get("/health")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert "timestamp" in data
+
+
+def test_list_snapshots_empty(client):
+    resp = client.get("/snapshots")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_snapshot_not_found(client):
+    resp = client.get("/snapshots/999")
+    assert resp.status_code == 404
+
+
+def test_list_snapshots_with_data(seeded_client):
+    resp = seeded_client.get("/snapshots")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert len(data) == 2
+
+
+def test_get_snapshot(seeded_client):
+    resp = seeded_client.get("/snapshots/1")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["snapshot"]["router"] == "rtr1"
+    assert data["prefix_count"] == 1
+
+
+def test_diff_endpoint(seeded_client):
+    resp = seeded_client.get("/diff?before=1&after=2")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["summary"]["added"] == 1
+    assert data["summary"]["changed"] == 1
+
+
+def test_diff_not_found(client):
+    resp = client.get("/diff?before=999&after=998")
+    assert resp.status_code == 404
+
+
+def test_list_snapshots_router_filter(seeded_client):
+    resp = seeded_client.get("/snapshots?router=rtr1")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 2
+
+    resp = seeded_client.get("/snapshots?router=nonexistent")
+    assert resp.status_code == 200
+    assert len(resp.json()) == 0
+
+
+def test_list_snapshots_invalid_router_name(client):
+    resp = client.get("/snapshots?router=;DROP TABLE")
+    assert resp.status_code == 422  # validation error
+
+
+def test_post_snapshots_no_routers(client, monkeypatch):
+    monkeypatch.setattr("bgp_route_analyzer.ROUTERS", [])
+    resp = client.post("/snapshots")
+    assert resp.status_code == 503
+
+
+def test_api_key_auth_required(tmp_path: Path, monkeypatch):
+    db = tmp_path / "auth_test.db"
+    monkeypatch.setattr("bgp_route_analyzer.DB_PATH", db)
+    monkeypatch.setattr("bgp_route_analyzer.API_KEY", "test-secret-key")
+
+    with TestClient(app) as c:
+        # No key -> 403
+        resp = c.get("/health")
+        assert resp.status_code == 403
+
+        # Wrong key -> 403
+        resp = c.get("/health", headers={"X-API-Key": "wrong"})
+        assert resp.status_code == 403
+
+        # Correct key -> 200
+        resp = c.get("/health", headers={"X-API-Key": "test-secret-key"})
+        assert resp.status_code == 200

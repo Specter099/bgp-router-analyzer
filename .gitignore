@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+bgp_snapshots.db
+routers.json
+routers.yaml
+.env
+*.egg-info/

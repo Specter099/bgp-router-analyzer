@@ -1,0 +1,18 @@
+[
+    {
+        "host": "10.0.0.1",
+        "username": "netops",
+        "password": "changeme",
+        "device_type": "cisco_ios",
+        "name": "edge-rtr-01",
+        "ssh_strict": false
+    },
+    {
+        "host": "10.0.0.2",
+        "username": "netops",
+        "key_file": "/home/netops/.ssh/id_rsa",
+        "device_type": "cisco_xe",
+        "name": "edge-rtr-02",
+        "ssh_strict": true
+    }
+]
