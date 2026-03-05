@@ -41,12 +41,13 @@ import textwrap
 import threading
 from collections.abc import AsyncGenerator, Generator
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import textfsm
 import uvicorn
-from fastapi import Depends, FastAPI, HTTPException, Path as PathParam, Query, Request, Security
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Security
+from fastapi import Path as PathParam
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
@@ -316,7 +317,7 @@ def _parse_bgp_table(raw_output: str) -> list[dict]:
     fsm = textfsm.TextFSM(template_fh)
     rows = fsm.ParseText(raw_output)
     headers = [h.lower() for h in fsm.header]
-    return [dict(zip(headers, row)) for row in rows if any(row)]
+    return [dict(zip(headers, row, strict=False)) for row in rows if any(row)]
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +334,7 @@ def save_snapshot(
     """Persist a snapshot and its prefixes; return the snapshot id."""
     if db_path is None:
         db_path = DB_PATH
-    captured_at = datetime.now(timezone.utc).isoformat()
+    captured_at = datetime.now(UTC).isoformat()
     with get_db(db_path) as conn:
         cur = conn.execute(
             "INSERT INTO snapshots (router, captured_at, raw_output) VALUES (?, ?, ?)",
@@ -392,7 +393,7 @@ def purge_old_snapshots(days: int, db_path: Path | None = None) -> int:
     """Delete snapshots older than N days. Returns count of deleted snapshots."""
     if db_path is None:
         db_path = DB_PATH
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat()
     with get_db(db_path) as conn:
         conn.execute(
             "DELETE FROM prefixes WHERE snapshot_id IN "
@@ -693,7 +694,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 @app.get("/health")
 @limiter.limit("60/minute")
 def health(request: Request) -> dict:
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "timestamp": datetime.now(UTC).isoformat()}
 
 
 @app.post("/snapshots", response_model=SnapshotResponse)

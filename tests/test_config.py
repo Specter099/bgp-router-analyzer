@@ -1,6 +1,7 @@
 import json
-import pytest
 from pathlib import Path
+
+import pytest
 
 from bgp_route_analyzer import _load_routers, _validate_cors_origins
 

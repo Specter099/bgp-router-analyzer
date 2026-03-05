@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from bgp_route_analyzer import (
@@ -101,7 +101,7 @@ def test_purge_old_snapshots(test_db: Path):
           "local_pref": "100", "weight": "0", "as_path": "65001", "origin": "i"}]
 
     # Insert a snapshot with old timestamp
-    old_time = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
+    old_time = (datetime.now(UTC) - timedelta(days=60)).isoformat()
     with sqlite3.connect(test_db) as conn:
         conn.execute(
             "INSERT INTO snapshots (router, captured_at, raw_output) VALUES (?, ?, ?)",
