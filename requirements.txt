@@ -1,4 +1,4 @@
-netmiko~=4.3
+netmiko~=4.6
 textfsm~=1.1
 fastapi~=0.110
 uvicorn[standard]~=0.41
