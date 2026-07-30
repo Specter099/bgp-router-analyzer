@@ -1,0 +1,6 @@
+# Development and test dependencies.
+# Includes everything in requirements.txt so the two cannot drift.
+-r requirements.txt
+
+httpx~=0.28
+pytest~=8.0
