@@ -54,3 +54,30 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install UI dependencies
+        working-directory: ui
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: ui
+        run: npm run lint
+
+      - name: Build UI
+        working-directory: ui
+        run: npm run build
+
+      - name: Verify build output
+        working-directory: ui
+        run: test -f dist/index.html && test -d dist/assets

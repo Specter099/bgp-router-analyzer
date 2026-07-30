@@ -4,7 +4,14 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 bgp_snapshots.db
+bgp_snapshots.db-wal
+bgp_snapshots.db-shm
 routers.json
 routers.yaml
 .env
 *.egg-info/
+
+# Admin UI build artifacts. Build with: cd ui && npm ci && npm run build
+# The server degrades to API-only when ui/dist is absent.
+ui/node_modules/
+ui/dist/

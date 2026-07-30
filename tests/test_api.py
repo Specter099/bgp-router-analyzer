@@ -51,7 +51,9 @@ def test_health(client):
 def test_list_snapshots_empty(client):
     resp = client.get("/snapshots")
     assert resp.status_code == 200
-    assert resp.json() == []
+    body = resp.json()
+    assert body["items"] == []
+    assert body["total"] == 0
 
 
 def test_snapshot_not_found(client):
@@ -62,8 +64,11 @@ def test_snapshot_not_found(client):
 def test_list_snapshots_with_data(seeded_client):
     resp = seeded_client.get("/snapshots")
     assert resp.status_code == 200
-    data = resp.json()
-    assert len(data) == 2
+    body = resp.json()
+    assert len(body["items"]) == 2
+    assert body["total"] == 2
+    # prefix_count comes back inline so the UI needs no follow-up request
+    assert body["items"][0]["prefix_count"] == 2
 
 
 def test_get_snapshot(seeded_client):
@@ -90,11 +95,11 @@ def test_diff_not_found(client):
 def test_list_snapshots_router_filter(seeded_client):
     resp = seeded_client.get("/snapshots?router=rtr1")
     assert resp.status_code == 200
-    assert len(resp.json()) == 2
+    assert len(resp.json()["items"]) == 2
 
     resp = seeded_client.get("/snapshots?router=nonexistent")
     assert resp.status_code == 200
-    assert len(resp.json()) == 0
+    assert resp.json()["items"] == []
 
 
 def test_list_snapshots_invalid_router_name(client):
@@ -136,7 +141,9 @@ def test_security_headers_present(client):
     assert resp.headers["X-Content-Type-Options"] == "nosniff"
     assert resp.headers["X-Frame-Options"] == "DENY"
     assert resp.headers["Cache-Control"] == "no-store"
-    assert resp.headers["Content-Security-Policy"] == "default-src 'none'"
+    csp = resp.headers["Content-Security-Policy"]
+    assert csp.startswith("default-src 'none'")
+    assert "frame-ancestors 'none'" in csp
     assert resp.headers["Referrer-Policy"] == "no-referrer"
 
 
@@ -209,12 +216,13 @@ def test_get_snapshot_response_shape(seeded_client):
 
 
 def test_list_snapshots_response_shape(seeded_client):
-    """[O-M2] List response should match SnapshotListItem model."""
+    """[O-M2] List response should match SnapshotPage/SnapshotListItem models."""
     resp = seeded_client.get("/snapshots")
     assert resp.status_code == 200
     data = resp.json()
-    assert len(data) > 0
-    item = data[0]
+    assert set(data) == {"items", "total", "limit", "offset"}
+    assert len(data["items"]) > 0
+    item = data["items"][0]
     assert "id" in item
     assert "router" in item
     assert "captured_at" in item
