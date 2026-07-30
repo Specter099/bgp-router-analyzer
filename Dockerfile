@@ -61,8 +61,11 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # somewhere to mount known_hosts, every poll would fail host-key verification
 # and the only workaround would be ssh_strict: false — which this project
 # treats as an invariant not to relax.
-RUN groupadd --gid 10001 --system bgp \
- && useradd --uid 10001 --gid 10001 --system --create-home --home-dir /home/bgp \
+# Not --system: that flag allocates from the system range (UID < 1000), so
+# combining it with an explicit 10001 makes useradd warn on every build that
+# the UID exceeds SYS_UID_MAX. The explicit ID is what matters here.
+RUN groupadd --gid 10001 bgp \
+ && useradd --uid 10001 --gid 10001 --create-home --home-dir /home/bgp \
             --shell /usr/sbin/nologin bgp \
  && mkdir -p /home/bgp/.ssh \
  && chown -R bgp:bgp /home/bgp \
