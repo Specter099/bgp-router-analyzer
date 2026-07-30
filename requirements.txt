@@ -1,6 +1,6 @@
 netmiko~=4.6
 textfsm~=1.1
 fastapi~=0.136
-uvicorn[standard]~=0.46
+uvicorn[standard]~=0.51
 pydantic~=2.13
 slowapi~=0.1
