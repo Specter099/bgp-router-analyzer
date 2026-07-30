@@ -45,7 +45,9 @@ docker compose up -d
 Two things trip people up here, both intentional:
 
 - **`chown 10001` on `routers.json`.** A `0600` file owned by your host user is unreadable inside the container. The app logs the reason and starts with no routers rather than crashing, so check the logs if `/routers` comes back empty.
-- **`known_hosts` is required.** `ssh_strict` defaults to `true` and the container ships no host keys, so without it every poll fails verification. Create the file *before* the first `docker compose up` — Docker turns a missing bind-mount source into an empty directory, and the mount then silently does nothing. Setting `ssh_strict: false` is not the fix; it disables MITM protection on your router credentials.
+- **`known_hosts` is required.** `ssh_strict` defaults to `true` and the container ships no host keys, so without it every poll fails verification. Create the file *before* the first `docker compose up` — Docker turns a missing bind-mount source into an empty directory, and the mount then silently does nothing. Setting `ssh_strict: false` is not the fix; it disables MITM protection on your router credentials, and the analyzer logs a warning naming every router in that state.
+
+  After rotating a router's host key, refresh its `known_hosts` entry. A *stale* entry fails the connection even for routers with `ssh_strict: false` — a mismatched key is rejected regardless of the missing-key policy, matching OpenSSH behaviour.
 
 Or without compose:
 

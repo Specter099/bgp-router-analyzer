@@ -172,7 +172,7 @@ def test_poll_router_loads_system_host_keys(monkeypatch):
     assert captured["ssh_strict"] is True  # [C1] still defaults on
 
 
-def test_ssh_strict_can_still_be_opted_out_per_router(monkeypatch):
+def test_ssh_strict_can_still_be_opted_out_per_router(monkeypatch, caplog):
     """Explicit opt-out must remain possible, but never silently."""
     captured: dict = {}
 
@@ -185,9 +185,30 @@ def test_ssh_strict_can_still_be_opted_out_per_router(monkeypatch):
 
     monkeypatch.setattr("bgp_route_analyzer.ConnectHandler",
                         lambda **kw: (captured.update(kw), _FakeConnection())[1])
-    bga.poll_router({"host": "10.0.0.1", "username": "u", "device_type": "cisco_ios",
-                     "name": "r1", "ssh_strict": False})
+    with caplog.at_level("WARNING"):
+        bga.poll_router({"host": "10.0.0.1", "username": "u", "device_type": "cisco_ios",
+                         "name": "r1", "ssh_strict": False})
     assert captured["ssh_strict"] is False
+    # "Never silently" has to mean something: a router running without host key
+    # verification must be identifiable from the logs.
+    assert any("verification is DISABLED" in r.message and "r1" in r.message
+               for r in caplog.records)
+
+
+def test_ssh_strict_default_logs_no_warning(monkeypatch, caplog):
+    """The secure default must not produce warning noise."""
+    class _FakeConnection:
+        def send_command(self, *_args, **_kwargs):
+            return ""
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr("bgp_route_analyzer.ConnectHandler", lambda **kw: _FakeConnection())
+    with caplog.at_level("WARNING"):
+        bga.poll_router({"host": "10.0.0.1", "username": "u",
+                         "device_type": "cisco_ios", "name": "r1"})
+    assert not any("verification is DISABLED" in r.message for r in caplog.records)
 
 
 def test_non_utf8_config_returns_empty(tmp_path: Path):

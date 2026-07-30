@@ -534,6 +534,15 @@ def poll_router(router_cfg: dict) -> tuple[str, list[dict]]:
     # [M3] Log router name at INFO, IP only at DEBUG
     log.info("Connecting to %s", router_cfg["name"])
     log.debug("Router %s address: %s", router_cfg["name"], router_cfg["host"])
+    if not router_cfg.get("ssh_strict", True):
+        # [C1] Opting out of host key verification is allowed but never silent:
+        # this router's session is exposed to MITM, and an operator reading the
+        # logs should be able to see which ones are in that state.
+        log.warning(
+            "Host key verification is DISABLED for %s (ssh_strict: false) — "
+            "this connection is not protected against man-in-the-middle attacks",
+            router_cfg["name"],
+        )
     try:
         connection = ConnectHandler(
             host=router_cfg["host"],
