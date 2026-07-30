@@ -27,6 +27,14 @@ services:
       BGP_ANALYZER_API_KEY: ${BGP_ANALYZER_API_KEY:?set BGP_ANALYZER_API_KEY in .env}
       BGP_DB_PATH: /data/bgp_snapshots.db
       BGP_ROUTER_CONFIG: /config/routers.json
+      # Router password fallback for entries in routers.json that omit
+      # "password". Without forwarding it here the documented env-var
+      # credential path silently never applies inside the container.
+      BGP_ROUTER_PASSWORD: ${BGP_ROUTER_PASSWORD:-}
+      # Set to 1 when TLS terminates at a reverse proxy in front of this
+      # container, so session cookies still get the Secure flag.
+      BGP_ASSUME_TLS: ${BGP_ASSUME_TLS:-}
+      BGP_CORS_ORIGINS: ${BGP_CORS_ORIGINS:-}
       # Optional tuning — see README.
       BGP_POLL_WORKERS: ${BGP_POLL_WORKERS:-5}
       BGP_SESSION_TTL: ${BGP_SESSION_TTL:-28800}
@@ -36,9 +44,15 @@ services:
     volumes:
       # Snapshot database. Named volume so it survives image rebuilds.
       - bgp-data:/data
-      # Router credentials, read-only. The app warns if this file is group- or
-      # world-readable, so chmod 600 it on the host.
+      # Router credentials, read-only. Must be readable by UID 10001 inside
+      # the container: chown 10001 routers.json && chmod 600 routers.json.
+      # A 0600 file owned by another UID is unreadable here, and the app will
+      # start with no routers configured (it logs the reason).
       - ./routers.json:/config/routers.json:ro
+      # SSH known_hosts. ssh_strict defaults to true and paramiko reads
+      # ~/.ssh/known_hosts, so without this every poll fails host-key
+      # verification. Generate with: ssh-keyscan -H <router> >> known_hosts
+      - ./known_hosts:/home/bgp/.ssh/known_hosts:ro
       # SSH keys, if routers.json uses key_file. Uncomment and point key_file
       # at /keys/<name> inside the container.
       # - ./keys:/keys:ro

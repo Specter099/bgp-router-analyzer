@@ -55,8 +55,18 @@ ENV PATH="/opt/venv/bin:$PATH" \
 # Fixed UID/GID so a bind-mounted data volume has predictable ownership on
 # the host. Running as root would also defeat init_db()'s 0600 chmod, since
 # root can read the database regardless.
+#
+# A real home directory is required, not optional: ssh_strict defaults to True
+# and paramiko's load_system_host_keys() reads ~/.ssh/known_hosts. Without
+# somewhere to mount known_hosts, every poll would fail host-key verification
+# and the only workaround would be ssh_strict: false — which this project
+# treats as an invariant not to relax.
 RUN groupadd --gid 10001 --system bgp \
- && useradd --uid 10001 --gid 10001 --system --no-create-home --shell /usr/sbin/nologin bgp
+ && useradd --uid 10001 --gid 10001 --system --create-home --home-dir /home/bgp \
+            --shell /usr/sbin/nologin bgp \
+ && mkdir -p /home/bgp/.ssh \
+ && chown -R bgp:bgp /home/bgp \
+ && chmod 700 /home/bgp/.ssh
 
 WORKDIR /app
 
@@ -81,8 +91,15 @@ USER bgp
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD ["python", "/app/docker-healthcheck.py"]
 
-# Exec form so the process is PID 1 and receives SIGTERM directly; the app
-# installs its own SIGINT/SIGTERM handlers for graceful shutdown mid-poll.
+# Exec form so the process is PID 1 and receives signals directly rather than
+# through a shell that would swallow them.
+#
+# Note on shutdown: in --serve mode uvicorn installs its own signal handlers,
+# and snapshot worker threads are daemons, so SIGTERM ends in-flight polls
+# abruptly. That is safe — SQLite runs in WAL mode and each snapshot commits
+# atomically — but it is not the graceful mid-poll drain that the CLI's
+# _shutdown_event provides for --snapshot runs.
+#
 # 0.0.0.0 is correct inside a network namespace — publish the port
 # deliberately, and set BGP_ANALYZER_API_KEY before exposing it.
 ENTRYPOINT ["python", "bgp_route_analyzer.py"]

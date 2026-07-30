@@ -148,10 +148,15 @@ SESSION_TTL_SECONDS = _env_int("BGP_SESSION_TTL", 8 * 3600, minimum=60)
 SESSION_IDLE_SECONDS = _env_int("BGP_SESSION_IDLE", 30 * 60, minimum=60)
 MAX_SESSIONS = 500
 
-# Set to True by the CLI when TLS is configured. Controls the `Secure` cookie
-# flag: a Secure cookie is never sent over plain HTTP, so forcing it on would
-# silently break loopback HTTP development.
-_tls_enabled = False
+# Controls the `Secure` cookie flag and HSTS. A Secure cookie is never sent
+# over plain HTTP, so this cannot simply default to True or loopback HTTP
+# development breaks silently.
+#
+# Set by the CLI when --ssl-cert/--ssl-key are given, or up front by
+# BGP_ASSUME_TLS for the common production topology where TLS terminates at a
+# reverse proxy and this process only ever sees HTTP. Without that escape
+# hatch, a proxied deployment could never issue a Secure session cookie.
+_tls_enabled = os.environ.get("BGP_ASSUME_TLS", "").lower() in ("1", "true", "yes")
 
 # token_hash -> session dict. Raw tokens are never stored, only their SHA-256
 # digest, so a memory dump or log leak does not yield usable credentials.
@@ -186,25 +191,38 @@ def _load_routers(config_path: str | None = None) -> list[dict]:
     """Load and validate router configuration from an external JSON file."""
     path = config_path or os.environ.get("BGP_ROUTER_CONFIG", "routers.json")
     resolved = Path(path).resolve()  # [M4] canonicalize path
-    if not resolved.exists():
-        return []
 
-    # [C4] Check file permissions (Unix only)
-    if sys.platform != "win32":
-        mode = resolved.stat().st_mode
-        if mode & (stat.S_IRGRP | stat.S_IROTH):
-            log.warning(
-                "Router config %s has overly permissive permissions (%o). "
-                "Recommend chmod 600.",
-                resolved, stat.S_IMODE(mode),
-            )
-
-    # [O-C1] Handle malformed JSON gracefully instead of crashing at import
+    # [O-C1] Every filesystem touch below is inside this guard on purpose.
+    # _load_routers() runs at module import, so any OSError escaping here kills
+    # the process before argparse runs — under a container restart policy that
+    # is a crash loop. It is not only open() that can fail: exists() and stat()
+    # raise PermissionError when a parent directory denies traversal, which is
+    # exactly what bind-mounting a config into a non-root container produces.
     try:
+        if not resolved.exists():
+            return []
+
+        # [C4] Check file permissions (Unix only)
+        if sys.platform != "win32":
+            mode = resolved.stat().st_mode
+            if mode & (stat.S_IRGRP | stat.S_IROTH):
+                log.warning(
+                    "Router config %s has overly permissive permissions (%o). "
+                    "Recommend chmod 600.",
+                    resolved, stat.S_IMODE(mode),
+                )
+
         with open(resolved) as f:
             raw = json.load(f)
     except json.JSONDecodeError as e:
         log.error("Invalid JSON in router config %s: %s", resolved, e)
+        return []
+    except OSError as e:
+        log.error(
+            "Cannot read router config %s: %s. Continuing with no routers configured — "
+            "check that the file is readable by the user running this process (uid=%s).",
+            resolved, e, getattr(os, "getuid", lambda: "n/a")(),
+        )
         return []
 
     if not isinstance(raw, list):
@@ -598,6 +616,24 @@ def save_snapshot(
     return snap_id
 
 
+def _redact_host(message: str, router_cfg: dict) -> str:
+    """Replace a router's address in an error string with its name.
+
+    poll_router() sanitizes the two Netmiko exceptions it catches explicitly,
+    but everything underneath it does not: paramiko's SSHException
+    ("Server '10.0.0.1' not found in known_hosts"), NoValidConnectionsError,
+    BadHostKeyException and socket.gaierror all embed the raw address. Those
+    strings end up in the job record, the audit log, and the /routers
+    `last_error` field, which would defeat _mask_host() entirely — so scrub
+    them at the boundary where every poll failure converges. [M3]
+    """
+    host = str(router_cfg.get("host", ""))
+    name = str(router_cfg.get("name", "router"))
+    if host and host in message:
+        message = message.replace(host, f"<{name}>")
+    return message
+
+
 def _snapshot_one(router_cfg: dict, db_path: Path, actor: str, source_ip: str | None) -> dict:
     """Poll and persist a single router. Never raises — returns a result dict.
 
@@ -623,17 +659,21 @@ def _snapshot_one(router_cfg: dict, db_path: Path, actor: str, source_ip: str | 
             "duration_seconds": round(time.monotonic() - started, 2),
         }
     except Exception as exc:  # [O-H3] One failing router must not abort the others
-        log.error("Failed to snapshot %s: %s", name, exc)
+        # Full detail (including the address) goes to the log only, at DEBUG,
+        # consistent with [M3]: addresses are never INFO-level or API-visible.
+        log.error("Failed to snapshot %s: %s", name, _redact_host(str(exc), router_cfg))
+        log.debug("Poll failure detail for %s", name, exc_info=True)
+        message = _redact_host(str(exc), router_cfg)[:500]
         record_audit(
             "poll_router", actor=actor, outcome="failure", target=name,
-            source_ip=source_ip, detail=str(exc)[:500], db_path=db_path,
+            source_ip=source_ip, detail=message, db_path=db_path,
         )
         return {
             "router": name,
             "status": "failed",
             "snapshot_id": None,
             "prefix_count": 0,
-            "error": str(exc)[:500],
+            "error": message,
             "duration_seconds": round(time.monotonic() - started, 2),
         }
 
@@ -808,7 +848,11 @@ def start_snapshot_job(
         # The worker never ran, so it will never release the lock for us.
         _snapshot_lock.release()
         raise
-    return _copy_job(job)
+    # Read back under the lock. Copying the live `job` dict directly would race
+    # the worker, which is already mutating it: a fast-failing router can append
+    # to job["routers"] or insert job["error"] mid-copy, yielding torn rows or a
+    # "dictionary changed size during iteration" RuntimeError.
+    return get_job(job_id) or _copy_job(job)
 
 
 # ---------------------------------------------------------------------------
@@ -988,6 +1032,56 @@ def count_snapshots(
         return conn.execute(f"SELECT COUNT(*) FROM snapshots{where}", params).fetchone()[0]
 
 
+def _normalize_timestamp(value: str) -> str:
+    """Parse an ISO 8601 timestamp and re-render it in UTC.
+
+    captured_at is stored as a UTC ISO string and filtered with string
+    comparison, so a caller-supplied bound carrying a non-UTC offset would
+    compare lexicographically against a different instant. Converting to UTC
+    first makes '2026-01-01T17:00:00+05:00' and '2026-01-01T12:00:00+00:00'
+    behave as the same moment, which they are. A naive value is treated as UTC.
+    """
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat()
+
+
+def list_snapshot_page(
+    router: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+    since: str | None = None,
+    until: str | None = None,
+    db_path: Path | None = None,
+) -> dict:
+    """Return one page of snapshots plus the matching total.
+
+    Both queries share a single connection so `total` cannot disagree with the
+    page it describes when a snapshot lands between them.
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    where, params = _snapshot_filters(router, since, until, alias="s.")
+    plain_where, plain_params = _snapshot_filters(router, since, until)
+    with get_db(db_path) as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM snapshots{plain_where}", plain_params
+        ).fetchone()[0]
+        rows = conn.execute(
+            "SELECT s.id, s.router, s.captured_at, "
+            "       (SELECT COUNT(*) FROM prefixes p WHERE p.snapshot_id = s.id) AS prefix_count "
+            f"FROM snapshots s{where} ORDER BY s.id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+    return {
+        "items": [dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 def router_inventory(routers: list[dict] | None = None, db_path: Path | None = None) -> list[dict]:
     """Health summary for every configured router.
 
@@ -1087,7 +1181,12 @@ def _mask_host(host: str) -> str:
     labels = host.split(".")
     if len(labels) > 2:
         return f"{labels[0]}.…{'.'.join(labels[-2:])}"
-    return host
+    if len(labels) == 2:
+        # e.g. "router1.local" — still identifying, so keep the domain and
+        # elide the host label rather than returning it whole.
+        return f"…{labels[-1]}"
+    # Single bare label: truncate rather than echo it back in full.
+    return f"{host[:2]}…" if len(host) > 3 else "…"
 
 
 # ---------------------------------------------------------------------------
@@ -1281,6 +1380,22 @@ def _is_ui_path(path: str) -> bool:
     return path == "/" or path == "/ui" or path.startswith("/ui/")
 
 
+def _secret_eq(supplied: str | None, expected: str | None) -> bool:
+    """Timing-safe secret comparison that tolerates arbitrary input. [C2]
+
+    hmac.compare_digest raises TypeError when handed a str containing
+    non-ASCII, which would turn an attacker-controlled header or login body
+    into an unauthenticated 500. Comparing encoded bytes keeps the constant-
+    time property while making any input a plain failed match.
+    """
+    if supplied is None or expected is None:
+        return False
+    return hmac.compare_digest(
+        supplied.encode("utf-8", "surrogateescape"),
+        expected.encode("utf-8", "surrogateescape"),
+    )
+
+
 async def verify_api_key(
     request: Request,
     key: str | None = Security(api_key_header),
@@ -1314,7 +1429,7 @@ async def verify_api_key(
     if session is not None:
         if request.method not in SAFE_METHODS:
             supplied = request.headers.get(CSRF_HEADER_NAME)
-            if not supplied or not hmac.compare_digest(supplied, session["csrf"]):
+            if not _secret_eq(supplied, session["csrf"]):
                 log.warning("CSRF token missing/invalid on %s %s from %s",
                             request.method, request.url.path, client)
                 record_audit("csrf_failure", actor=session["actor"], outcome="failure",
@@ -1324,7 +1439,7 @@ async def verify_api_key(
         return
 
     # 2. API key header
-    if key is not None and hmac.compare_digest(key, API_KEY):  # [C2] Timing-safe
+    if _secret_eq(key, API_KEY):  # [C2] Timing-safe
         request.state.actor = "api-key"
         return
 
@@ -1492,7 +1607,7 @@ def api_login(request: Request, response: Response, body: LoginRequest) -> Login
             status_code=503,
             detail="Authentication is not configured (BGP_ANALYZER_API_KEY unset).",
         )
-    if not hmac.compare_digest(body.api_key, API_KEY):  # [C2] Timing-safe
+    if not _secret_eq(body.api_key, API_KEY):  # [C2] Timing-safe
         log.warning("Failed login attempt from %s", client)
         record_audit("login", actor="anonymous", outcome="failure", source_ip=client)
         raise HTTPException(status_code=403, detail="Invalid API key")
@@ -1547,6 +1662,7 @@ def api_auth_status(request: Request) -> AuthStatus:
 @limiter.limit("5/minute")
 def api_take_snapshots(
     request: Request,
+    response: Response,
     wait: bool = Query(False, description="Block until polling finishes and return snapshot IDs"),
 ) -> dict:
     """Start a snapshot job across all configured routers.
@@ -1569,6 +1685,9 @@ def api_take_snapshots(
             _snapshot_lock.release()
         record_audit("snapshot", actor=actor, source_ip=client,
                      detail=f"blocking; {len(snap_ids)} snapshot(s)")
+        # 202 Accepted describes the async path. This one already finished, so
+        # the honest status is 200.
+        response.status_code = 200
         return SnapshotResponse(
             snapshot_ids=snap_ids,
             message=f"Captured {len(snap_ids)} snapshot(s).",
@@ -1618,17 +1737,21 @@ def api_list_snapshots(
     until: str | None = Query(None, description="ISO timestamp upper bound (inclusive)"),
 ) -> dict:
     """List stored snapshots, newest first, with a total for pagination."""
+    bounds: dict[str, str | None] = {}
     for value, label in ((since, "since"), (until, "until")):
-        if value is not None:
-            try:
-                datetime.fromisoformat(value)
-            except ValueError:
-                raise HTTPException(
-                    status_code=422, detail=f"{label} must be an ISO 8601 timestamp"
-                ) from None
-    items = list_snapshots(router=router, limit=limit, offset=offset, since=since, until=until)
-    total = count_snapshots(router=router, since=since, until=until)
-    return {"items": items, "total": total, "limit": limit, "offset": offset}
+        if value is None:
+            bounds[label] = None
+            continue
+        try:
+            bounds[label] = _normalize_timestamp(value)
+        except ValueError:
+            raise HTTPException(
+                status_code=422, detail=f"{label} must be an ISO 8601 timestamp"
+            ) from None
+    return list_snapshot_page(
+        router=router, limit=limit, offset=offset,
+        since=bounds["since"], until=bounds["until"],
+    )
 
 
 @app.get("/snapshots/{snapshot_id}", response_model=SnapshotDetailResponse)
@@ -1894,14 +2017,17 @@ def _cli() -> None:
             print("ERROR: --ssl-cert and --ssl-key must be provided together.", file=sys.stderr)
             sys.exit(1)
 
-        _tls_enabled = bool(args.ssl_cert and args.ssl_key)
+        # BGP_ASSUME_TLS (already folded into _tls_enabled at import) covers
+        # reverse-proxy termination, so don't clear it when no cert is passed.
+        _tls_enabled = _tls_enabled or bool(args.ssl_cert and args.ssl_key)
 
         # [H5] Warn when API key auth is enabled but TLS is not configured
         if API_KEY and not _tls_enabled:
             log.warning(
                 "API key authentication is enabled but TLS is not configured. "
                 "API keys and session cookies will be transmitted in plaintext, and "
-                "session cookies will not carry the Secure flag. Use --ssl-cert and --ssl-key."
+                "session cookies will not carry the Secure flag. Use --ssl-cert and "
+                "--ssl-key, or set BGP_ASSUME_TLS=1 if TLS terminates at a proxy."
             )
 
         # [M1] Warn when binding to non-loopback without API key

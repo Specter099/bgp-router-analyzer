@@ -80,12 +80,23 @@ def test_one_failing_router_does_not_abort_others(job_db, monkeypatch):
 
 
 def test_polling_runs_concurrently(job_db, monkeypatch):
-    """Three 0.3s polls must finish well under the 0.9s a serial run would take."""
-    monkeypatch.setattr("bgp_route_analyzer.poll_router", _fake_poll(delay=0.3))
+    """All three routers must be in flight at once, not polled one after another.
+
+    Asserted by observing overlap rather than wall-clock time: a timing budget
+    turns into a flaky test on a loaded CI runner.
+    """
     monkeypatch.setattr("bgp_route_analyzer.MAX_POLL_WORKERS", 3)
-    started = time.monotonic()
-    collect_snapshot_results(list(ROUTERS), job_db)
-    assert time.monotonic() - started < 0.75
+    barrier = threading.Barrier(3, timeout=10)
+
+    def _poll(cfg):
+        # Only passes if all three threads reach this point together; a serial
+        # implementation would deadlock here and raise BrokenBarrierError.
+        barrier.wait()
+        return "raw", list(SAMPLE_PREFIXES)
+
+    monkeypatch.setattr("bgp_route_analyzer.poll_router", _poll)
+    results = collect_snapshot_results(list(ROUTERS), job_db)
+    assert [r["status"] for r in results] == ["success"] * 3
 
 
 def test_worker_pool_is_bounded(job_db, monkeypatch):
@@ -211,7 +222,8 @@ def test_post_snapshots_wait_returns_legacy_shape(job_db, monkeypatch):
     monkeypatch.setattr("bgp_route_analyzer.poll_router", _fake_poll())
     with TestClient(app) as c:
         resp = c.post("/snapshots?wait=true")
-        assert resp.status_code == 202
+        # 200, not 202: the work is already done by the time this returns.
+        assert resp.status_code == 200
         body = resp.json()
         assert len(body["snapshot_ids"]) == 3
         assert "Captured 3" in body["message"]

@@ -85,6 +85,7 @@ CI (`.github/workflows/ci.yml`) has four jobs: `lint` (ruff/flake8/mypy on 3.13)
 | `BGP_CORS_ORIGINS` | Comma-separated allowed CORS origins | unset (CORS disabled) |
 | `BGP_ROUTER_PASSWORD` | Default router password override (used when a router entry omits `password`) | unset |
 | `BGP_ENABLE_DOCS` | Enable `/docs` and `/redoc` OpenAPI UI (`1`/`true`/`yes`) | unset (docs disabled) |
+| `BGP_ASSUME_TLS` | Treat traffic as TLS-protected when a proxy terminates TLS; sets `Secure` cookies + HSTS | unset |
 | `BGP_SESSION_TTL` | Absolute session lifetime, seconds | `28800` (8h) |
 | `BGP_SESSION_IDLE` | Session idle timeout, seconds | `1800` (30m) |
 | `BGP_POLL_WORKERS` | Max concurrent router SSH polls | `5` |
@@ -225,7 +226,9 @@ Things that will bite if changed carelessly:
 - **App files are root-owned**, writable only by root, while the process runs as UID 10001 — a compromised process cannot rewrite its own code.
 - **Compose sets `read_only: true`** with a tmpfs on `/tmp`. Anything new that writes outside `/data` or `/tmp` will fail there.
 - **`.dockerignore` excludes `routers.json`, `*.db`, `.env`, and `*.pem`/`*.key`.** Keep it that way — the build context is not a secret store.
-- **`ENTRYPOINT` is exec-form** so the app is PID 1 and receives SIGTERM directly, which its existing `_shutdown_event` handlers rely on for graceful mid-poll shutdown.
+- **`ENTRYPOINT` is exec-form** so the app is PID 1 and receives signals directly. Note that in `--serve` mode uvicorn installs its own handlers and job threads are daemons, so SIGTERM ends in-flight polls abruptly — safe (WAL + atomic per-snapshot commits) but *not* the graceful drain `_shutdown_event` gives `--snapshot` runs. Don't document it as graceful.
+- **The runtime user has a real home directory** (`/home/bgp/.ssh`). This is load-bearing: `ssh_strict` defaults to `True` and paramiko reads `~/.ssh/known_hosts`, so without somewhere to mount `known_hosts` every poll fails verification and the only workaround would be relaxing `ssh_strict`.
+- **`routers.json` must be readable by UID 10001.** A `0600` file owned by another UID is unreadable in the container. `_load_routers()` now catches `OSError` around *all* filesystem access — `exists()` and `stat()` raise too, not just `open()` — because it runs at import, so an escaping error kills the process before argparse and becomes a restart-policy crash loop.
 
 ## UI Structure
 

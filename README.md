@@ -31,11 +31,21 @@ The fastest way to run the whole thing — API, UI, and database — in one cont
 ```bash
 cp .env.example .env                          # set BGP_ANALYZER_API_KEY
 cp routers.json.example routers.json
-chmod 600 routers.json
+
+# The container runs as UID 10001, so it must own the config to read it.
+sudo chown 10001:10001 routers.json && chmod 600 routers.json
+
+# ssh_strict defaults to true, so the container needs the routers' host keys.
+ssh-keyscan -H 10.0.0.1 10.0.0.2 > known_hosts
 
 docker compose up -d
 # UI: http://127.0.0.1:8000/ui
 ```
+
+Two things trip people up here, both intentional:
+
+- **`chown 10001` on `routers.json`.** A `0600` file owned by your host user is unreadable inside the container. The app logs the reason and starts with no routers rather than crashing, so check the logs if `/routers` comes back empty.
+- **`known_hosts` is required.** `ssh_strict` defaults to `true` and the container ships no host keys, so without it every poll fails verification. Setting `ssh_strict: false` is not the fix — it disables MITM protection on your router credentials.
 
 Or without compose:
 
@@ -66,7 +76,9 @@ docker compose run --rm analyzer --purge 30
 - Healthcheck sends `X-API-Key`, so it works with authentication enabled
 - Compose adds `read_only`, `cap_drop: ALL`, `no-new-privileges`, and a memory limit
 
-**Ports and TLS.** Compose publishes on `127.0.0.1:8000` only, matching the app's own loopback default. Before exposing it more widely, set `BGP_ANALYZER_API_KEY` and put TLS in front of it — either a reverse proxy, or mount certs and add `--ssl-cert`/`--ssl-key` to the command. Session cookies only get the `Secure` flag when the app itself terminates TLS.
+**Ports and TLS.** Compose publishes on `127.0.0.1:8000` only, matching the app's own loopback default. Before exposing it more widely, set `BGP_ANALYZER_API_KEY` and put TLS in front of it.
+
+If a reverse proxy terminates TLS, set `BGP_ASSUME_TLS=1` — otherwise the app only ever sees HTTP and will never mark session cookies `Secure` or emit HSTS. If the app terminates TLS itself, mount the certs and add `--ssl-cert`/`--ssl-key`, which sets the same flag automatically.
 
 **Persistence.** The database lives on the `bgp-data` volume at `/data`. SQLite in WAL mode writes `-wal` and `-shm` siblings, so the directory (not just the file) must be writable — that is why `/data` is owned by the runtime user.
 
@@ -134,6 +146,7 @@ chmod 600 routers.json
 | `BGP_CORS_ORIGINS` | Comma-separated allowed CORS origins | unset (CORS disabled) |
 | `BGP_ROUTER_PASSWORD` | Router password used when an entry omits `password` | unset |
 | `BGP_ENABLE_DOCS` | Enable `/docs` and `/redoc` | unset (disabled) |
+| `BGP_ASSUME_TLS` | Treat the connection as TLS-protected (proxy terminates TLS) — sets `Secure` cookies and HSTS | unset |
 | `BGP_SESSION_TTL` | Absolute session lifetime, seconds | `28800` (8h) |
 | `BGP_SESSION_IDLE` | Session idle timeout, seconds | `1800` (30m) |
 | `BGP_POLL_WORKERS` | Max concurrent router SSH polls | `5` |
