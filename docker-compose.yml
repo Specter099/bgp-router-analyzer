@@ -1,0 +1,70 @@
+# BGP Route Analyzer — single-service deployment.
+#
+#   cp .env.example .env         # then set BGP_ANALYZER_API_KEY
+#   cp routers.json.example routers.json && chmod 600 routers.json
+#   docker compose up -d
+#
+# UI: http://127.0.0.1:8000/ui
+
+services:
+  analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bgp-route-analyzer:latest
+    container_name: bgp-route-analyzer
+    restart: unless-stopped
+
+    # Published on loopback only, mirroring the application's own default bind
+    # address. Change to "8000:8000" *after* setting BGP_ANALYZER_API_KEY and
+    # terminating TLS in front of it.
+    ports:
+      - "127.0.0.1:8000:8000"
+
+    environment:
+      # Required for authentication. With this unset the API and UI are open
+      # to anyone who can reach the port.
+      BGP_ANALYZER_API_KEY: ${BGP_ANALYZER_API_KEY:?set BGP_ANALYZER_API_KEY in .env}
+      BGP_DB_PATH: /data/bgp_snapshots.db
+      BGP_ROUTER_CONFIG: /config/routers.json
+      # Optional tuning — see README.
+      BGP_POLL_WORKERS: ${BGP_POLL_WORKERS:-5}
+      BGP_SESSION_TTL: ${BGP_SESSION_TTL:-28800}
+      BGP_SESSION_IDLE: ${BGP_SESSION_IDLE:-1800}
+      BGP_ENABLE_DOCS: ${BGP_ENABLE_DOCS:-}
+
+    volumes:
+      # Snapshot database. Named volume so it survives image rebuilds.
+      - bgp-data:/data
+      # Router credentials, read-only. The app warns if this file is group- or
+      # world-readable, so chmod 600 it on the host.
+      - ./routers.json:/config/routers.json:ro
+      # SSH keys, if routers.json uses key_file. Uncomment and point key_file
+      # at /keys/<name> inside the container.
+      # - ./keys:/keys:ro
+
+    # Hardening. The application writes only to /data; everything else can be
+    # immutable. tmpfs covers anything the runtime needs to scribble in /tmp.
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    # Bounded so a runaway poll cannot starve the host.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bgp-data:
+    driver: local

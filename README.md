@@ -18,14 +18,63 @@ A Python tool for automated BGP table snapshot collection, time-series storage, 
 
 ## Requirements
 
-- Python 3.12+
-- Node.js 20+ (only to build the admin UI; the API runs without it)
+- Python 3.12+ and Node.js 20+ — or just Docker (see [below](#docker))
 - Network access to edge routers via SSH
 - Routers must support `show ip bgp` (or equivalent — see [Customization](#customization))
 
 ---
 
-## Installation
+## Docker
+
+The fastest way to run the whole thing — API, UI, and database — in one container.
+
+```bash
+cp .env.example .env                          # set BGP_ANALYZER_API_KEY
+cp routers.json.example routers.json
+chmod 600 routers.json
+
+docker compose up -d
+# UI: http://127.0.0.1:8000/ui
+```
+
+Or without compose:
+
+```bash
+docker build -t bgp-route-analyzer .
+docker run -d --name bgp \
+  -e BGP_ANALYZER_API_KEY="$(openssl rand -hex 32)" \
+  -v bgp-data:/data \
+  -v "$PWD/routers.json:/config/routers.json:ro" \
+  -p 127.0.0.1:8000:8000 \
+  bgp-route-analyzer
+```
+
+Run CLI commands against the same volume:
+
+```bash
+docker compose run --rm analyzer --snapshot
+docker compose run --rm analyzer --list
+docker compose run --rm analyzer --diff --before 1 --after 2
+docker compose run --rm analyzer --purge 30
+```
+
+**What the image does:**
+
+- Multi-stage build — Node compiles the UI, then is discarded; the runtime image carries only Python, the venv, `bgp_route_analyzer.py`, and `ui/dist`
+- Runs as non-root (UID 10001); application files are root-owned and read-only to it
+- Ships runtime dependencies only (`requirements.txt`); test tooling stays in `requirements-dev.txt`
+- Healthcheck sends `X-API-Key`, so it works with authentication enabled
+- Compose adds `read_only`, `cap_drop: ALL`, `no-new-privileges`, and a memory limit
+
+**Ports and TLS.** Compose publishes on `127.0.0.1:8000` only, matching the app's own loopback default. Before exposing it more widely, set `BGP_ANALYZER_API_KEY` and put TLS in front of it — either a reverse proxy, or mount certs and add `--ssl-cert`/`--ssl-key` to the command. Session cookies only get the `Secure` flag when the app itself terminates TLS.
+
+**Persistence.** The database lives on the `bgp-data` volume at `/data`. SQLite in WAL mode writes `-wal` and `-shm` siblings, so the directory (not just the file) must be writable — that is why `/data` is owned by the runtime user.
+
+**Router SSH keys.** If `routers.json` uses `key_file`, mount the key directory read-only and point `key_file` at the in-container path (there is a commented-out `./keys:/keys:ro` mount in `docker-compose.yml`).
+
+---
+
+## Installation (without Docker)
 
 ```bash
 git clone <repo-url>
@@ -33,7 +82,7 @@ cd bgp-route-analyzer
 
 python -m venv .venv
 source .venv/bin/activate       # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # or requirements.txt for runtime only
 
 # Build the admin UI (optional — omit for API-only operation)
 cd ui && npm ci && npm run build && cd ..
@@ -318,7 +367,11 @@ def _parse_bgp_table(raw_output: str, platform: str = "cisco_ios") -> list[dict]
 ```
 bgp-route-analyzer/
 ├── bgp_route_analyzer.py   # Backend — polling, storage, diff, API, CLI
-├── requirements.txt
+├── docker-healthcheck.py   # Container healthcheck (auth-aware)
+├── Dockerfile              # Multi-stage: UI build → venv build → slim runtime
+├── docker-compose.yml
+├── requirements.txt        # Runtime dependencies
+├── requirements-dev.txt    # Adds pytest + httpx for the test suite
 ├── routers.json.example    # Copy to routers.json (gitignored)
 ├── tests/                  # pytest suite
 ├── ui/                     # React admin UI (Vite + TypeScript)

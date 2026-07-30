@@ -4,5 +4,3 @@ fastapi~=0.136
 uvicorn[standard]~=0.46
 pydantic~=2.13
 slowapi~=0.1
-httpx~=0.28
-pytest~=8.0

@@ -6,20 +6,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 BGP Route Analyzer — a Python tool that SSH-polls edge routers (via Netmiko), parses BGP tables (via TextFSM), stores time-series snapshots in SQLite, and diffs pre/post change windows. Exposes a CLI, a security-hardened FastAPI REST API, and a React admin UI served from the same origin at `/ui`.
 
-Two components:
+Components:
 - `bgp_route_analyzer.py` — the entire backend (CLI + API), ~1900 lines
 - `ui/` — Vite + React + TypeScript admin SPA, built to `ui/dist` and served by FastAPI
+- `Dockerfile` / `docker-compose.yml` — multi-stage container build
+- `docker-healthcheck.py` — auth-aware container healthcheck
 
 ## Setup
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements-dev.txt   # requirements.txt is runtime-only
 
 # Admin UI (optional — the server runs API-only without it)
 cd ui && npm ci && npm run build
 ```
+
+**Two requirements files.** `requirements.txt` holds runtime deps only, so the Docker image doesn't ship pytest. `requirements-dev.txt` starts with `-r requirements.txt` and adds `httpx` + `pytest`, so the two cannot drift. CI and local development install the dev file; the Dockerfile installs the runtime one.
 
 Copy `routers.json.example` to `routers.json` and fill in router credentials (or set `BGP_ROUTER_PASSWORD` to inject a password without storing it in the file).
 
@@ -60,7 +64,14 @@ cd ui && npm run lint     # tsc --noEmit
 cd ui && npm run build    # emits ui/dist for FastAPI to serve
 ```
 
-CI (`.github/workflows/ci.yml`) has three jobs: `lint` (ruff/flake8/mypy on 3.13), `test` (pytest on the 3.12/3.13 matrix), and `ui` (npm ci, typecheck, build). All run on every push/PR against `main`.
+```bash
+# Docker
+docker compose up -d                             # API + UI on 127.0.0.1:8000
+docker compose run --rm analyzer --snapshot      # CLI against the same volume
+docker build -t bgp-route-analyzer .
+```
+
+CI (`.github/workflows/ci.yml`) has four jobs: `lint` (ruff/flake8/mypy on 3.13), `test` (pytest on the 3.12/3.13 matrix), `ui` (npm ci, typecheck, build), and `docker` (build the image, then smoke-test that it becomes healthy, refuses unauthenticated requests, serves the UI, runs as UID 10001, and writes the DB to `/data`). All run on every push/PR against `main`.
 
 **Dev-server note:** run `npm run dev` alongside a real `--serve` backend. The Vite proxy forwards API paths to `127.0.0.1:8000` on the *same* origin deliberately — the session cookie is `SameSite=strict` and would be dropped on a cross-origin request.
 
@@ -203,6 +214,18 @@ Indexes: `idx_prefixes_snapshot`, `idx_snapshots_router_captured`, `idx_snapshot
 Audit actions currently recorded: `login`, `logout`, `csrf_failure`, `snapshot`, `poll_router`, `purge`.
 
 All tables use `CREATE TABLE IF NOT EXISTS`; there is no migration framework, so an existing DB picks up `audit_log` and the new indexes automatically on next `init_db()`, but any future column change needs a manual `ALTER TABLE` or a fresh DB.
+
+## Container Notes
+
+Things that will bite if changed carelessly:
+
+- **`/data` is owned by the runtime user and `chmod 700`.** SQLite in WAL mode writes `-wal`/`-shm` siblings, so the *directory* must be writable — making only the DB file writable is not enough.
+- **The healthcheck is a script, not an inline `CMD`.** `/health` requires auth when `BGP_ANALYZER_API_KEY` is set, so `docker-healthcheck.py` sends `X-API-Key`; a plain `curl /health` would fail closed and mark healthy containers unhealthy. It also lets the check be tested outside a container.
+- **`--host 0.0.0.0` in `CMD` is correct** inside a network namespace. The app's existing "binding non-loopback without an API key" warning still fires and is still the right signal. Compose publishes to `127.0.0.1` only.
+- **App files are root-owned**, writable only by root, while the process runs as UID 10001 — a compromised process cannot rewrite its own code.
+- **Compose sets `read_only: true`** with a tmpfs on `/tmp`. Anything new that writes outside `/data` or `/tmp` will fail there.
+- **`.dockerignore` excludes `routers.json`, `*.db`, `.env`, and `*.pem`/`*.key`.** Keep it that way — the build context is not a secret store.
+- **`ENTRYPOINT` is exec-form** so the app is PID 1 and receives SIGTERM directly, which its existing `_shutdown_event` handlers rely on for graceful mid-poll shutdown.
 
 ## UI Structure
 

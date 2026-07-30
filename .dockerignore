@@ -1,0 +1,27 @@
+# Secrets and local data — must never enter the build context.
+routers.json
+routers.yaml
+.env
+*.db
+*.db-wal
+*.db-shm
+*.pem
+*.key
+
+# Local environments and build output (the image builds its own).
+.venv/
+__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+ui/node_modules/
+ui/dist/
+ui/*.tsbuildinfo
+
+# Repo metadata not needed at runtime.
+.git/
+.github/
+tasks/
+*.md
+!README.md
