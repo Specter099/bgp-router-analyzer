@@ -62,6 +62,7 @@ import textfsm
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, Security
 from fastapi import Path as PathParam
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import APIKeyHeader
@@ -214,8 +215,11 @@ def _load_routers(config_path: str | None = None) -> list[dict]:
 
         with open(resolved) as f:
             raw = json.load(f)
-    except json.JSONDecodeError as e:
-        log.error("Invalid JSON in router config %s: %s", resolved, e)
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError belongs here too: a latin-1 or binary file makes
+        # json.load() fail at the decode step, which is the same import-time
+        # crash-loop class as the OSError case below.
+        log.error("Cannot parse router config %s: %s", resolved, e)
         return []
     except OSError as e:
         log.error(
@@ -293,7 +297,14 @@ def init_db(db_path: Path | None = None) -> None:
     """Create tables if they don't exist."""
     if db_path is None:
         db_path = DB_PATH
-    with sqlite3.connect(db_path) as conn:
+    with sqlite3.connect(db_path, timeout=5.0) as conn:
+        # Set WAL here and only here. journal_mode is a persistent property of
+        # the database file, so it does not need re-applying per connection —
+        # and applying it per connection is actively harmful: the switch needs
+        # a brief exclusive lock, so concurrent pollers opening connections at
+        # the same moment can fail with "database is locked" even though the
+        # writes themselves would have serialized fine.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS snapshots (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -349,10 +360,13 @@ def init_db(db_path: Path | None = None) -> None:
 def get_db(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
     if db_path is None:
         db_path = DB_PATH
-    # [M2] Set busy timeout and enable WAL mode for concurrent access
+    # [M2] Busy timeout for concurrent access. journal_mode is deliberately not
+    # set here — it persists in the database file (init_db sets it) and
+    # re-applying it on every connection causes lock contention between
+    # concurrent pollers. busy_timeout and foreign_keys are genuinely
+    # per-connection and must stay.
     conn = sqlite3.connect(db_path, timeout=5.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA foreign_keys=ON")  # [O-M9] Enforce FK constraints
     try:
@@ -528,6 +542,13 @@ def poll_router(router_cfg: dict) -> tuple[str, list[dict]]:
             device_type=router_cfg["device_type"],
             key_file=router_cfg.get("key_file"),
             ssh_strict=router_cfg.get("ssh_strict", True),  # [C1] Default True
+            # Required for ssh_strict to be usable at all. Netmiko only calls
+            # paramiko's load_system_host_keys() when this is True, and it
+            # defaults to False — so without it the client starts with an empty
+            # host-key set and RejectPolicy, and every connection fails with
+            # "not found in known_hosts" no matter what is in ~/.ssh. Harmless
+            # when the file is absent: paramiko simply loads nothing.
+            system_host_keys=True,
             timeout=30,
         )
     except NetmikoAuthenticationException:
@@ -1057,8 +1078,10 @@ def list_snapshot_page(
 ) -> dict:
     """Return one page of snapshots plus the matching total.
 
-    Both queries share a single connection so `total` cannot disagree with the
-    page it describes when a snapshot lands between them.
+    Both queries run on one connection, which narrows the window in which a
+    concurrent write can skew `total` relative to its page. It does not close
+    it: sqlite3's default isolation gives each SELECT its own read snapshot,
+    so this is a smaller race, not no race. Harmless for a paginated list.
     """
     if db_path is None:
         db_path = DB_PATH
@@ -1386,14 +1409,23 @@ def _secret_eq(supplied: str | None, expected: str | None) -> bool:
     hmac.compare_digest raises TypeError when handed a str containing
     non-ASCII, which would turn an attacker-controlled header or login body
     into an unauthenticated 500. Comparing encoded bytes keeps the constant-
-    time property while making any input a plain failed match.
+    time property.
+
+    The encode itself can also fail: `surrogateescape` only round-trips the
+    low surrogate range U+DC80-U+DCFF, so a lone *high* surrogate such as
+    U+D800 still raises UnicodeEncodeError. Anything unencodable cannot equal
+    a real key, so it is simply a failed match. That early return is a timing
+    difference, but it reveals only "the input was malformed", never anything
+    about the secret.
     """
     if supplied is None or expected is None:
         return False
-    return hmac.compare_digest(
-        supplied.encode("utf-8", "surrogateescape"),
-        expected.encode("utf-8", "surrogateescape"),
-    )
+    try:
+        supplied_bytes = supplied.encode("utf-8", "surrogateescape")
+        expected_bytes = expected.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(supplied_bytes, expected_bytes)
 
 
 async def verify_api_key(
@@ -1583,6 +1615,29 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
     log.error("Unhandled %s on %s %s", type(exc).__name__, request.method, request.url.path)
     log.debug("Exception details:", exc_info=True)
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """Return a 422 that never echoes the rejected input back.
+
+    FastAPI's default handler embeds the offending value in the response body.
+    Besides reflecting attacker-controlled data, serializing it can itself
+    fail: a request body containing a lone surrogate (e.g. "\\ud800") makes the
+    default handler raise UnicodeEncodeError while rendering, turning a
+    validation error into an unauthenticated 500 on /auth/login.
+
+    Only the location and error type are reported — enough for a client to fix
+    its request, with none of the submitted value.
+    """
+    safe_errors = [
+        {"loc": [str(part) for part in err.get("loc", ())], "type": str(err.get("type", ""))}
+        for err in exc.errors()
+    ]
+    log.info("Validation error on %s %s: %s", request.method, request.url.path, safe_errors)
+    return JSONResponse(status_code=422, content={"detail": safe_errors})
 
 
 # [M6] Rate limit all endpoints with appropriate thresholds

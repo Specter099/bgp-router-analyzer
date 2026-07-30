@@ -49,9 +49,12 @@ services:
       # A 0600 file owned by another UID is unreadable here, and the app will
       # start with no routers configured (it logs the reason).
       - ./routers.json:/config/routers.json:ro
-      # SSH known_hosts. ssh_strict defaults to true and paramiko reads
-      # ~/.ssh/known_hosts, so without this every poll fails host-key
-      # verification. Generate with: ssh-keyscan -H <router> >> known_hosts
+      # SSH known_hosts. ssh_strict defaults to true, so without this every
+      # poll fails host-key verification.
+      #   ssh-keyscan -H <router> > known_hosts
+      # Create the file BEFORE the first `docker compose up`: Docker creates a
+      # *directory* at a bind-mount source that does not exist yet, and the
+      # mount then silently does nothing.
       - ./known_hosts:/home/bgp/.ssh/known_hosts:ro
       # SSH keys, if routers.json uses key_file. Uncomment and point key_file
       # at /keys/<name> inside the container.

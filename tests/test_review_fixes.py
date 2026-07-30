@@ -144,6 +144,59 @@ def test_poll_failure_does_not_leak_host_into_job_or_audit(tmp_path: Path, monke
         assert "10.20.30.40" not in c.get("/routers").text
 
 
+def test_poll_router_loads_system_host_keys(monkeypatch):
+    """ssh_strict is useless without system_host_keys=True.
+
+    Netmiko only calls paramiko's load_system_host_keys() when this kwarg is
+    set, and it defaults to False. Without it, ssh_strict=True leaves the
+    client with an empty host-key set plus RejectPolicy, so every connection
+    is rejected regardless of what ~/.ssh/known_hosts contains.
+    """
+    captured: dict = {}
+
+    class _FakeConnection:
+        def send_command(self, *_args, **_kwargs):
+            return ""
+
+        def disconnect(self):
+            pass
+
+    def _fake_connect(**kwargs):
+        captured.update(kwargs)
+        return _FakeConnection()
+
+    monkeypatch.setattr("bgp_route_analyzer.ConnectHandler", _fake_connect)
+    bga.poll_router({"host": "10.0.0.1", "username": "u",
+                     "device_type": "cisco_ios", "name": "r1"})
+    assert captured["system_host_keys"] is True
+    assert captured["ssh_strict"] is True  # [C1] still defaults on
+
+
+def test_ssh_strict_can_still_be_opted_out_per_router(monkeypatch):
+    """Explicit opt-out must remain possible, but never silently."""
+    captured: dict = {}
+
+    class _FakeConnection:
+        def send_command(self, *_args, **_kwargs):
+            return ""
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr("bgp_route_analyzer.ConnectHandler",
+                        lambda **kw: (captured.update(kw), _FakeConnection())[1])
+    bga.poll_router({"host": "10.0.0.1", "username": "u", "device_type": "cisco_ios",
+                     "name": "r1", "ssh_strict": False})
+    assert captured["ssh_strict"] is False
+
+
+def test_non_utf8_config_returns_empty(tmp_path: Path):
+    """A binary/latin-1 config fails at decode, not JSON parse — same crash class."""
+    config = tmp_path / "routers.json"
+    config.write_bytes(b'[{"name": "caf\xe9"}]')
+    assert _load_routers(str(config)) == []
+
+
 def test_mask_host_masks_short_hostnames():
     """Two-label and bare hostnames were previously returned in full."""
     assert _mask_host("router1.local") == "…local"
@@ -174,6 +227,41 @@ def test_non_ascii_login_is_403_not_500(tmp_path: Path, monkeypatch):
     monkeypatch.setattr("bgp_route_analyzer.API_KEY", "test-key")
     with TestClient(app) as c:
         assert c.post("/auth/login", json={"api_key": "kü"}).status_code == 403
+
+
+@pytest.mark.parametrize("bad", ["\\ud800", "\\udcff", "\\udfff"])
+def test_lone_surrogate_login_is_4xx_not_500(tmp_path: Path, monkeypatch, bad):
+    """Lone surrogates must not produce an unauthenticated 500.
+
+    Two separate failure modes converge here: surrogateescape only round-trips
+    U+DC80-U+DCFF, so a high surrogate still breaks the encode; and FastAPI's
+    default validation handler echoes the rejected value back, which itself
+    raises UnicodeEncodeError while rendering the 422.
+    """
+    db = tmp_path / "surrogate.db"
+    init_db(db)
+    monkeypatch.setattr("bgp_route_analyzer.DB_PATH", db)
+    monkeypatch.setattr("bgp_route_analyzer.API_KEY", "test-key")
+    with TestClient(app, raise_server_exceptions=False) as c:
+        resp = c.post(
+            "/auth/login",
+            content=f'{{"api_key": "{bad}"}}',
+            headers={"Content-Type": "application/json"},
+        )
+        assert 400 <= resp.status_code < 500, f"got {resp.status_code}"
+
+
+def test_validation_errors_do_not_echo_input(tmp_path: Path, monkeypatch):
+    """A 422 body must not reflect the submitted value back to the client."""
+    db = tmp_path / "echo.db"
+    init_db(db)
+    monkeypatch.setattr("bgp_route_analyzer.DB_PATH", db)
+    monkeypatch.setattr("bgp_route_analyzer.API_KEY", "test-key")
+    marker = "sensitive-value-should-not-be-echoed"
+    with TestClient(app, raise_server_exceptions=False) as c:
+        resp = c.post("/auth/login", json={"api_key": {"nested": marker}})
+        assert resp.status_code == 422
+        assert marker not in resp.text
 
 
 def test_non_ascii_api_key_header_is_403_not_500(tmp_path: Path, monkeypatch):
@@ -251,6 +339,48 @@ def test_since_filter_with_offset_matches_same_instant(tmp_path: Path, monkeypat
         assert late["total"] == 0
 
 
+# --- WAL must stay on without being reapplied per connection -------------
+
+
+def test_wal_is_enabled_and_persists(tmp_path: Path):
+    """Moving journal_mode out of get_db() must not silently lose WAL.
+
+    WAL is a persistent property of the file, so setting it in init_db() is
+    enough — but if that ever regresses, concurrent access degrades badly and
+    nothing else would catch it.
+    """
+    import sqlite3
+
+    db = tmp_path / "wal.db"
+    init_db(db)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+    # Still WAL when reached through the normal connection helper.
+    with bga.get_db(db) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        # Per-connection pragmas must still be applied.
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_concurrent_writers_do_not_hit_database_locked(tmp_path: Path, monkeypatch):
+    """Reapplying journal_mode per connection caused sporadic lock errors.
+
+    Setting WAL takes a brief exclusive lock, so several pollers opening
+    connections simultaneously could fail with "database is locked" even
+    though their writes would have serialized fine.
+    """
+    db = tmp_path / "concurrent.db"
+    init_db(db)
+    monkeypatch.setattr("bgp_route_analyzer.MAX_POLL_WORKERS", 8)
+    monkeypatch.setattr("bgp_route_analyzer.poll_router",
+                        lambda cfg: ("raw", list(SAMPLE)))
+    routers = [{"name": f"r{i}", "host": f"10.0.0.{i}",
+                "device_type": "cisco_ios", "username": "u"} for i in range(16)]
+    results = bga.collect_snapshot_results(routers, db)
+    failures = [r for r in results if r["status"] != "success"]
+    assert not failures, f"unexpected failures: {failures}"
+
+
 # --- Page and total must come from one connection ------------------------
 
 
@@ -284,8 +414,21 @@ def test_wait_true_returns_200(tmp_path: Path, monkeypatch):
         resp = c.post("/snapshots?wait=true")
         assert resp.status_code == 200
         assert len(resp.json()["snapshot_ids"]) == 1
-        # The async path still reports 202.
-        assert c.post("/snapshots").status_code == 202
+
+        # The async path still reports 202. Await it before returning: the
+        # monkeypatched poll_router and DB_PATH are reverted at teardown, so a
+        # job still running past the end of the test would fall through to the
+        # real poll_router (a 30s SSH timeout, holding _snapshot_lock) and
+        # init_db() against the real DB_PATH.
+        async_resp = c.post("/snapshots")
+        assert async_resp.status_code == 202
+        job_id = async_resp.json()["id"]
+        deadline = __import__("time").monotonic() + 10
+        while __import__("time").monotonic() < deadline:
+            if bga.get_job(job_id)["status"] != "running":
+                break
+            __import__("time").sleep(0.01)
+        assert bga.get_job(job_id)["status"] != "running"
 
 
 # --- Session expiry paths previously uncovered ---------------------------

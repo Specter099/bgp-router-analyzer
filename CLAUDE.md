@@ -156,6 +156,9 @@ This codebase has been through dedicated security and operational hardening pass
 - API key comparisons must use `hmac.compare_digest`, never `==`/`!=`.
 - Router config fields are allowlisted (`ALLOWED_ROUTER_FIELDS`) and `device_type` is validated against `SUPPORTED_DEVICE_TYPES` — extend these sets rather than bypassing validation.
 - All SQL is parameterized — never interpolate user input into a query string.
+- `journal_mode=WAL` is set in `init_db()` only. It persists in the database file; re-applying it per connection needs a brief exclusive lock and caused sporadic "database is locked" failures under concurrent polling. `busy_timeout` and `foreign_keys` *are* per-connection and must stay in `get_db()`.
+- Secret comparison goes through `_secret_eq()`, never `hmac.compare_digest` directly — the raw function raises `TypeError` on non-ASCII `str` and `UnicodeEncodeError` on lone surrogates, either of which turns attacker-controlled input into an unauthenticated 500.
+- The `RequestValidationError` handler must not echo submitted values. FastAPI's default does, which both reflects attacker input and can itself raise while rendering.
 - The rate limiter keys off the real socket IP (`_get_client_ip`), not proxy headers, unless a trusted-proxy config is added deliberately.
 - Exception responses stay generic (`"Internal server error"`); detailed errors go to logs only, and only at DEBUG.
 - New DB files/config files should end up `0600`, not world-readable.
@@ -227,7 +230,7 @@ Things that will bite if changed carelessly:
 - **Compose sets `read_only: true`** with a tmpfs on `/tmp`. Anything new that writes outside `/data` or `/tmp` will fail there.
 - **`.dockerignore` excludes `routers.json`, `*.db`, `.env`, and `*.pem`/`*.key`.** Keep it that way — the build context is not a secret store.
 - **`ENTRYPOINT` is exec-form** so the app is PID 1 and receives signals directly. Note that in `--serve` mode uvicorn installs its own handlers and job threads are daemons, so SIGTERM ends in-flight polls abruptly — safe (WAL + atomic per-snapshot commits) but *not* the graceful drain `_shutdown_event` gives `--snapshot` runs. Don't document it as graceful.
-- **The runtime user has a real home directory** (`/home/bgp/.ssh`). This is load-bearing: `ssh_strict` defaults to `True` and paramiko reads `~/.ssh/known_hosts`, so without somewhere to mount `known_hosts` every poll fails verification and the only workaround would be relaxing `ssh_strict`.
+- **The runtime user has a real home directory** (`/home/bgp/.ssh`) *and* `poll_router()` passes `system_host_keys=True`. Both halves are required: netmiko only calls paramiko's `load_system_host_keys()` when that kwarg is set, and it defaults to `False`. Without it, `ssh_strict=True` leaves an empty host-key set plus `RejectPolicy`, so every connection is rejected no matter what `known_hosts` contains — mounting the file alone does nothing.
 - **`routers.json` must be readable by UID 10001.** A `0600` file owned by another UID is unreadable in the container. `_load_routers()` now catches `OSError` around *all* filesystem access — `exists()` and `stat()` raise too, not just `open()` — because it runs at import, so an escaping error kills the process before argparse and becomes a restart-policy crash loop.
 
 ## UI Structure
