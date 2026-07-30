@@ -16,6 +16,63 @@ A Python tool for automated BGP table snapshot collection, time-series storage, 
 
 ---
 
+## Screenshots
+
+> All screenshots use a synthetic dataset — the router names, addresses, and AS
+> numbers are fabricated, using the ranges reserved for documentation
+> (RFC 5737 / RFC 6996). They are not captures from a real network.
+
+**Routers** — health at a glance. Each card shows the last successful poll, the
+current prefix count with its delta since the previous snapshot, and the most
+recent error. Host addresses are masked; credentials are never returned by the
+API.
+
+![Router inventory and health](docs/screenshots/routers.png)
+
+**Live snapshot jobs** — *Take snapshot* polls every router in parallel and
+streams results back as each one finishes, so a slow or unreachable device is
+visible immediately instead of at the end.
+
+![Snapshot job in progress](docs/screenshots/job-progress.png)
+
+**Compare** — pick a before/after pair and see added, removed, and changed
+prefixes colour-coded, with attribute-level before→after on the changed ones.
+Below, an AS-path prepend and a local-preference change on `10.0.0.0/8`, one
+prefix withdrawn and one new.
+
+![Diff between two snapshots](docs/screenshots/diff.png)
+
+**Snapshots** — paginated and filterable by router and date range.
+
+![Snapshot browser](docs/screenshots/snapshots.png)
+
+**Snapshot detail** — the parsed BGP table, filterable across network, next hop,
+and AS path.
+
+![Snapshot detail with prefix table](docs/screenshots/snapshot-detail.png)
+
+**Audit** — every login, snapshot, per-router poll result, and purge, with actor,
+source IP, and outcome.
+
+![Audit log](docs/screenshots/audit.png)
+
+<details>
+<summary>Sign-in and light theme</summary>
+
+Authentication is required whenever `BGP_ANALYZER_API_KEY` is set. The key is
+exchanged once for an `HttpOnly` session cookie, so it never stays in
+JavaScript-reachable storage.
+
+![Sign in](docs/screenshots/login.png)
+
+The UI follows the operating system's colour-scheme preference:
+
+![Router inventory in light theme](docs/screenshots/routers-light.png)
+
+</details>
+
+---
+
 ## Requirements
 
 - Python 3.12+ and Node.js 20+ — or just Docker (see [below](#docker))
@@ -166,7 +223,7 @@ python bgp_route_analyzer.py --serve
 # open http://127.0.0.1:8000/ui
 ```
 
-Sign in with the API key. Four views:
+Sign in with the API key. Four views — see [Screenshots](#screenshots) above:
 
 - **Routers** — per-router health cards (last poll, prefix count and delta, last error), plus a *Take snapshot* button that streams live per-router progress as the job runs
 - **Snapshots** — paginated, filterable by router and date range; drill into any snapshot for a searchable prefix table
@@ -388,6 +445,7 @@ bgp-route-analyzer/
 ├── requirements.txt        # Runtime dependencies
 ├── requirements-dev.txt    # Adds pytest + httpx for the test suite
 ├── routers.json.example    # Copy to routers.json (gitignored)
+├── docs/screenshots/       # README images
 ├── tests/                  # pytest suite
 ├── ui/                     # React admin UI (Vite + TypeScript)
 │   ├── src/

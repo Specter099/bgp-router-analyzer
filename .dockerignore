@@ -19,9 +19,11 @@ ui/node_modules/
 ui/dist/
 ui/*.tsbuildinfo
 
-# Repo metadata not needed at runtime.
+# Repo metadata not needed at runtime. docs/ holds README screenshots, which
+# would otherwise ship ~0.5MB into the build context for no reason.
 .git/
 .github/
 tasks/
+docs/
 *.md
 !README.md
