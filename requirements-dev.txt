@@ -3,4 +3,4 @@
 -r requirements.txt
 
 httpx~=0.28
-pytest~=8.0
+pytest~=9.1
